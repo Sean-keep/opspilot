@@ -22,8 +22,8 @@ interface NavItem {
 
 const NAV_ITEMS: readonly NavItem[] = [
   { label: '运行状态', routeName: 'dashboard', permissions: [] },
-  { label: '服务器', routeName: null, permissions: ['server.read'] },
-  { label: '凭据', routeName: null, permissions: ['credential.read'] },
+  { label: '服务器', routeName: 'servers', permissions: ['server.read'] },
+  { label: '凭据', routeName: 'credentials', permissions: ['credential.read'] },
   { label: '模板', routeName: null, permissions: ['template.read'] },
   { label: '任务', routeName: null, permissions: ['task.read'] },
   { label: '应用', routeName: null, permissions: ['app.read'] },

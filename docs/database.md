@@ -30,10 +30,18 @@ URL 里也带了 `init_command` 做同样的事 —— 三层兜底，因为时�
 | `ops_role_permissions` | 角色↔权限，`UNIQUE(role_id, permission_id)` |
 | `ops_audit_logs` | 审计。`snapshot` 为脱敏后的 JSON |
 
-### S1
+### S1 已落地（迁移 `0002`）
 
-`ops_servers`、`ops_server_groups`、`ops_server_group_members`、`ops_credentials`、
-`ops_server_facts`
+| 表 | 用途 |
+|---|---|
+| `ops_credentials` | 加密凭据。`payload_encrypted` 为 Fernet 密文，**任何 API 响应都不含该列**；`secret_ref` 是模板/任务用的稳定句柄（`cred:<id>`） |
+| `ops_servers` | 受管主机。含主机密钥三态（`unverified`/`pending_confirm`/`verified`/`mismatch`）与最后一次检查结果 |
+| `ops_server_groups` | 服务器分组 |
+| `ops_server_group_members` | 主机↔分组，`UNIQUE(server_id, group_id)`，无代理主键 |
+| `ops_server_facts` | 系统事实快照，**只追加**。每次检查插一行，不改旧行 |
+
+`ops_servers.host_key_fingerprint` 是信任锚。地址或端口变更会把该列清空并回到
+`unverified` —— 新端点就是新主机，旧 pin 不再适用。
 
 ### S2
 

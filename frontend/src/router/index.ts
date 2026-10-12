@@ -21,6 +21,16 @@ const router = createRouter({
           name: 'dashboard',
           component: () => import('@/views/Dashboard.vue'),
         },
+        {
+          path: 'servers',
+          name: 'servers',
+          component: () => import('@/views/Servers.vue'),
+        },
+        {
+          path: 'credentials',
+          name: 'credentials',
+          component: () => import('@/views/Credentials.vue'),
+        },
       ],
     },
   ],

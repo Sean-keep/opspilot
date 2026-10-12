@@ -64,10 +64,15 @@ def test_upgrade_head_is_repeatable(empty_test_db: str) -> None:
     # A repeat run must not emit DDL. "Running upgrade" would mean it re-ran.
     assert "Running upgrade" not in second.stdout + second.stderr
 
-    # Current revision is the initial one.
+    # Current revision must be whatever alembic reports as the head — the
+    # assertion stays valid as S2/S3/S4 add migrations.
+    heads = _run_alembic(["heads"], empty_test_db)
+    assert heads.returncode == 0, heads.stderr
+    head_id = heads.stdout.strip().split()[0]
     current = _run_alembic(["current"], empty_test_db)
     assert current.returncode == 0, current.stderr
-    assert "0001_initial_auth_and_audit" in current.stdout
+    assert head_id in current.stdout, (head_id, current.stdout)
+    assert "(head)" in current.stdout
 
 
 def test_schema_conventions(empty_test_db: str) -> None:
@@ -93,6 +98,12 @@ def test_schema_conventions(empty_test_db: str) -> None:
                 "ops_user_roles",
                 "ops_role_permissions",
                 "ops_audit_logs",
+                # S1
+                "ops_credentials",
+                "ops_servers",
+                "ops_server_groups",
+                "ops_server_group_members",
+                "ops_server_facts",
                 "alembic_version",
             }
             assert expected <= tables, f"missing: {expected - tables}"

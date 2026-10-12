@@ -9,9 +9,11 @@ integration tests are skipped rather than silently mocked green.
 
 from __future__ import annotations
 
+import base64
 import os
 import sys
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,39 @@ from sqlalchemy.orm import Session
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+# Keys for the optional live SSH target. Test-scoped on purpose: they are not
+# part of the production Settings model, and they are never read by the app.
+SSH_TEST_ENV_KEYS = (
+    "OPSPILOT_TEST_SSH_HOST",
+    "OPSPILOT_TEST_SSH_PORT",
+    "OPSPILOT_TEST_SSH_USER",
+    "OPSPILOT_TEST_SSH_KEY_FILE",
+)
+
+
+def _load_ssh_test_env() -> None:
+    """Expose ``OPSPILOT_TEST_SSH_*`` from ``.env`` to ``os.environ``.
+
+    ``pydantic-settings`` only feeds ``Settings``; these keys are read directly
+    by the live-transport fixtures. Loading them here keeps a plain ``pytest``
+    working once the operator has filled in ``.env`` — no wrapper script
+    required, and no magic that the production process would inherit.
+    """
+    env_file = REPO_ROOT / ".env"
+    if not env_file.is_file():
+        return
+    try:
+        from dotenv import dotenv_values
+    except ImportError:  # pragma: no cover - dotenv ships with pydantic-settings
+        return
+    values = dotenv_values(env_file)
+    for key in SSH_TEST_ENV_KEYS:
+        if not os.environ.get(key) and values.get(key):
+            os.environ[key] = str(values[key])
+
+
+_load_ssh_test_env()
 
 from backend.app.auth.permissions import DEFAULT_ROLES, PERMISSION_CATALOG  # noqa: E402
 from backend.app.auth.schemas import UserCreate  # noqa: E402
@@ -41,6 +76,12 @@ TEST_DB_NAME = os.environ.get("OPSPILOT_TEST_DB_NAME", "opspilot_test")
 BOOTSTRAP_ADMIN = "admin"
 BOOTSTRAP_PASSWORD = "test-admin-password-1234"
 
+# A deterministic Fernet key so credential round-trips are reproducible.
+# Fernet requires urlsafe-base64 of exactly 32 raw bytes — a prose placeholder
+# would fail at encrypt time and make every credential test error for the wrong
+# reason. This value is public and only ever guards the throwaway test DB.
+TEST_MASTER_KEY = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode()
+
 
 # --------------------------------------------------------------------------
 # Settings / engine
@@ -49,7 +90,7 @@ BOOTSTRAP_PASSWORD = "test-admin-password-1234"
 def settings() -> Iterator[Settings]:
     """Settings pointing at the test database, with test-safe secrets."""
     os.environ.setdefault("OPSPILOT_SECRET_KEY", "test-secret-key-not-for-production")
-    os.environ.setdefault("OPSPILOT_MASTER_KEY", "test-master-key-not-for-production")
+    os.environ.setdefault("OPSPILOT_MASTER_KEY", TEST_MASTER_KEY)
     os.environ.setdefault("OPSPILOT_ENV", "dev")
     os.environ.setdefault("OPSPILOT_TEST_DB_NAME", TEST_DB_NAME)
     clear_settings_cache()
@@ -160,6 +201,50 @@ def viewer(db: Session, seeded: Session) -> Any:
     auth.grant_role(user, "viewer")
     db.commit()
     return user
+
+
+# --------------------------------------------------------------------------
+# Optional live SSH target
+# --------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class SshTarget:
+    host: str
+    port: int
+    user: str
+    private_key_path: Path
+
+    def read_private_key(self) -> str:
+        return self.private_key_path.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="session")
+def ssh_target() -> SshTarget:
+    """A real, disposable SSH target for transport tests.
+
+    Configured with ``OPSPILOT_TEST_SSH_*``. When those are absent the live
+    transport tests skip rather than pretending to pass — a green suite that
+    never opened a socket would be worse than a skipped one.
+
+    The only sanctioned target is the local ``opstest`` account created by
+    ``scripts/setup-ssh-test-target.sh``. Tests never point this at a
+    production host.
+    """
+    host = os.environ.get("OPSPILOT_TEST_SSH_HOST", "").strip()
+    key_path = os.environ.get("OPSPILOT_TEST_SSH_KEY_FILE", "").strip()
+    if not host or not key_path:
+        pytest.skip(
+            "OPSPILOT_TEST_SSH_HOST / OPSPILOT_TEST_SSH_KEY_FILE not set; "
+            "live SSH tests need the local opstest target"
+        )
+    path = Path(key_path)
+    if not path.is_file():
+        pytest.skip(f"SSH test key {path} is missing")
+    return SshTarget(
+        host=host,
+        port=int(os.environ.get("OPSPILOT_TEST_SSH_PORT", "22")),
+        user=os.environ.get("OPSPILOT_TEST_SSH_USER", "opstest").strip() or "opstest",
+        private_key_path=path,
+    )
 
 
 # --------------------------------------------------------------------------

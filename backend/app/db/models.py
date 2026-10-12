@@ -16,14 +16,26 @@ from backend.app.auth.models import (
     User,
     UserRole,
 )
+from backend.app.credentials.models import Credential
 from backend.app.db.base import Base
+from backend.app.inventory.models import (
+    Server,
+    ServerFacts,
+    ServerGroup,
+    ServerGroupMember,
+)
 
 __all__ = [
     "AuditLog",
     "Base",
+    "Credential",
     "Permission",
     "Role",
     "RolePermission",
+    "Server",
+    "ServerFacts",
+    "ServerGroup",
+    "ServerGroupMember",
     "User",
     "UserRole",
 ]

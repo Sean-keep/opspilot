@@ -110,6 +110,47 @@ viewer 调 `POST /auth/users` 会拿到 403 且消息里含缺失的权限码。
 - 需要提权的步骤走**受限 sudo 白名单**，不是 `sudo -s`。
 - 命令一律 argv 列表，超时可控（`OPSPILOT_SSH_CONNECT_TIMEOUT` / `OPSPILOT_SSH_COMMAND_TIMEOUT`）。
 
+### 首次接入是两步，不是一步
+
+`discover-hostkey` 只做一次**未认证、不执行任何命令**的握手，取出对端公钥指纹并存成
+`pending_confirm`。此时平台对这台主机**完全不信任**，任何 check / 动作都会被
+`409 host_key_not_verified` 拒绝，连 socket 都不会建立。
+
+之后由操作员在界面上**逐字输入**指纹（`accept-hostkey`），后端用
+`hmac.compare_digest` 与对端提供的值做常数时间比对，匹配才置 `verified`。
+输入不匹配返回 `409 host_key_mismatch`，并且这次失败本身进审计。
+
+对端后来换了一把钥匙时：`discover-hostkey` 检测到指纹与已 pin 的值不同，直接
+`409 host_key_mismatch` 并把状态打成 `mismatch`，**绝不**静默换信任锚。要重新信任，
+必须有人先调查，再走一次完整的 accept。
+
+修改 `hostname` / `port` 会清空 pin 并退回 `unverified` —— 新地址就是新主机。
+
+### argv 分离的现实约束
+
+Paramiko 的 `exec_command` 收的是字符串，对端走登录 shell 解析；标准 sshd 没有
+"exec 不经 shell" 的通道。因此 `quote_argv()` 对**每一个** argv 元素单独
+`shlex.quote` 后再拼接：含 `;`、`$()`、反引号、换行的参数会被包成一个惰性 token，
+不会被 shell 拆开执行。有测试用 `echo 'hello; touch /tmp/opspilot-pwned'` 实测，
+输出是原样字符串且文件从未生成。
+
+参数在进 argv 之前还要过一层 Pydantic 校验：hostname 拒绝空白、shell 元字符、
+路径分隔符与前导 `-`；ssh_user 只允许 `[A-Za-z0-9_-]`。两层都过才到传输层。
+
+### 私钥只在一次连接的生命周期里落盘
+
+明文私钥不在 `ExecContext` 上、不进日志、不进审计快照。需要 path 的 Paramiko 走
+`staged_private_key()`：`mkstemp` + `fchmod 0600` + `fsync`，连接结束（含异常）后
+`unlink`。API 响应里也没有任何字段能装下它 —— `CredentialOut` 根本没有这个字段。
+
+### S1 边界：谁去连主机
+
+S1 的 `POST /servers/{id}/check` 是只读检查，固定 argv，由 API 进程同步执行（任务引擎
+在 S2 才有）。这是文档化的取舍：在 Worker/任务模型存在之前，检查必须有个落点。执行
+逻辑本身挂在 `ExecPort` 协议后面（`backend/app/executor/`），S2 把同一个实现搬进
+Worker 即可，API 那一侧不再解密凭据、不再开 socket。S3 起的所有**动作**执行只在
+Worker。
+
 ## 远端执行边界
 
 - **不允许任意 Shell。** 只有 Action Registry 里注册的动作可执行。

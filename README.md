@@ -278,13 +278,46 @@ journalctl -u opspilot-api -n 50 --no-pager
 
 ---
 
-## 已知限制（S0）
+## 已知限制（S1）
 
 - 登录失败限速计数在**进程内存**里。API 以单进程跑在 systemd 下时够用；若将来水平扩展，
   需要把计数挪到 MySQL。见 `docs/security-model.md`。
+- **连通性检查由 API 进程同步执行**（S1 没有任务引擎）。它只跑固定只读 argv，且必须
+  先过主机密钥信任。S2 把执行搬进 Worker 后，API 不再解密凭据、不再开 socket。
+- 凭据目前只支持 `ssh_key` 做连通性检查；`ssh_password` / `sudo_password` 已能存取，
+  使用它们的通道在 S3 的 Action Registry 里接。
 - 任务引擎、SSE、模板协议、应用发布尚未实现（S2–S4）。
 - Worker 目前是可启动 / 可优雅退出的空转循环，认领逻辑在 S2 填入。
-- 前端只有登录、外壳与健康状态页；侧栏里尚未接入的条目标注「即将开放」。
+- 前端有登录、外壳、健康状态、服务器、凭据五个页面；其余侧栏条目标注「即将开放」。
+
+---
+
+## SSH 测试目标（S1/S4 用）
+
+本仓库的远程执行测试只打一台**可销毁**的本地目标，绝不对生产机做破坏性测试。
+
+```bash
+# 装 openssh-server、建非 root 的 opstest 用户、生成专用密钥、收紧 sudoers
+sudo bash scripts/setup-ssh-test-target.sh
+```
+
+脚本会创建 `/opt/opspilot/apps` 与 `/opt/opspilot-test`（属主 `opstest`，写入不需要 sudo），
+把私钥放在 `/etc/opspilot/ssh-test/opstest_ed25519`（mode 600），并在
+`/etc/sudoers.d/opspilot-opstest` 里只放行 `systemctl` 查询/重启、unit 安装到
+`/etc/systemd/system/`、以及 `/opt/opspilot/apps` 下的软链切换。**不放行** `chmod` /
+`chown` / `cp` / `mv` / `rm` / `dd` / `sh` / `bash` / `sudo -s`。
+
+然后在 `.env` 里填：
+
+```dotenv
+OPSPILOT_TEST_SSH_HOST=127.0.0.1
+OPSPILOT_TEST_SSH_PORT=22
+OPSPILOT_TEST_SSH_USER=opstest
+OPSPILOT_TEST_SSH_KEY_FILE=/etc/opspilot/ssh-test/opstest_ed25519
+```
+
+四项要么全填、要么全空。全空时 `backend/tests/test_ssh_live.py` **跳过**而不是假装通过。
+应用本身不读这几个键，它们只被测试夹具读取。
 
 ---
 
@@ -295,9 +328,27 @@ journalctl -u opspilot-api -n 50 --no-pager
 ```bash
 . .venv/bin/activate && export PYTHONPATH=$(pwd)
 alembic upgrade head && alembic upgrade head   # 第二次必须无 "Running upgrade"
-pytest -q backend/tests shared/tests
+pytest backend/tests worker/tests shared/tests
 ruff check .
 mypy backend worker shared
 cd frontend && npm run lint && npm run typecheck && npm run test && npm run build
 find . -iname '*docker*' -o -iname 'Dockerfile*' -o -iname 'docker-compose*'
 ```
+
+---
+
+## S1 收口记录
+
+在 S0 之上新增：服务器资产、加密凭据、SSH 主机密钥信任链、只读系统检查与事实快照、
+对应的前端页面。门禁命令与 S0 相同，结果：
+
+- `pytest backend/tests worker/tests shared/tests` → **159 passed**（S0 时 84）
+- `ruff check .` → All checks passed
+- `mypy backend worker shared` → Success: no issues found in 70 source files
+- `npm run lint` / `typecheck` / `test`（15 passed）/ `build` → 全绿
+- `find . -iname '*docker*' …` → 空
+- 端到端冒烟（真 MySQL + 真 SSH 到本地 `opstest`）：未信任时 check 被 409 拒绝；
+  discover 得到的指纹与 `ssh-keygen -lf` 一致；填错指纹 accept 被 409 拒绝；
+  正确确认后 check 采到 `ubuntu-24.04 / x86_64 / 12 核 / 15940 MB / 1006.85 GB`；
+  所有响应体与审计行均无密钥材料；注入 payload `echo 'hello; touch /tmp/opspilot-pwned'`
+  保持单个 argv token，文件未生成。
