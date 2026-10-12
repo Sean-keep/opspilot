@@ -1,0 +1,45 @@
+# Build context for the OPTIONAL quickstart image (see Dockerfile header).
+# The rule that matters most: nothing secret and nothing bulky.
+
+# Secrets — .env is the runtime config file and must never enter an image.
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+known_hosts
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+node_modules/
+
+# VCS / docs tooling
+.git/
+.github/
+.claude/
+*.md
+!README.md
+
+# Tests and local scratch — not needed to run the stack
+backend/tests/
+worker/tests/
+shared/tests/
+templates/**/tests/
+docs/
+systemd/
+/tmp/
+opspilot_test*

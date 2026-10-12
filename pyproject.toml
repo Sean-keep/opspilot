@@ -11,7 +11,9 @@ requires-python = ">=3.12"
 license = { text = "Proprietary" }
 
 # Dependency ranges are pinned to a compatible window and refreshed deliberately.
-# No container runtime is required or supported: see README "No container runtime".
+# The product runs under systemd on a plain host; no container runtime is
+# required. `Dockerfile` / `docker-compose.yml` are only the optional local
+# quickstart — see README "硬约束" and "5 分钟跑起来".
 dependencies = [
   "fastapi>=0.115,<0.150",
   "uvicorn>=0.30,<0.60",

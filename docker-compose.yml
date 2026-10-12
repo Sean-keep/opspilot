@@ -1,0 +1,169 @@
+# OpsPilot — OPTIONAL local quickstart. Not the product's runtime.
+#
+# The product runs as two systemd units on a plain Ubuntu/Debian host; see
+# README "Ubuntu systemd 部署" for that path and "硬约束" for why containers
+# are not it. This file exists only so the stack can be stood up locally in a
+# few minutes — `docker compose up --build`, then open http://127.0.0.1:8088.
+#
+# What it deliberately does NOT do:
+#   * no Kubernetes, no orchestrator, no sidecar mesh — none may be added
+#   * no DDL from the API/Worker entrypoint: schema changes run in the one-shot
+#     `init` service, and `alembic upgrade head` is idempotent by design
+#   * no secrets in this file. Every value is interpolated from an env file
+#     (default `.env`; override with `docker compose --env-file <file> …`).
+#     Compose refuses to start unless the three that matter are set.
+#
+# One knob for config: `--env-file`. Everything is ${VAR} interpolation rather
+# than service `env_file:`, so the file you name is the file the stack reads.
+# The only other knobs are the two registry build-args below, which default to
+# the official upstreams.
+
+name: opspilot
+
+# Registry overrides for the image build. Defaults are the official upstreams;
+# set them in the env file only if your link to those is unusable. They affect
+# the build alone — nothing at runtime reads them.
+x-build-args: &build-args
+  PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+  NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org/}
+
+# Shared app settings. api / worker / init each merge this and then override
+# the two or three keys that differ (bind address, DB host, worker id).
+x-app-env: &app-env
+  OPSPILOT_ENV: ${OPSPILOT_ENV:-dev}
+  OPSPILOT_API_HOST: ${OPSPILOT_API_HOST:-127.0.0.1}
+  OPSPILOT_API_PORT: ${OPSPILOT_API_PORT:-8080}
+  OPSPILOT_LOG_LEVEL: ${OPSPILOT_LOG_LEVEL:-INFO}
+  OPSPILOT_DB_HOST: db
+  OPSPILOT_DB_PORT: ${OPSPILOT_DB_PORT:-3306}
+  OPSPILOT_DB_NAME: ${OPSPILOT_DB_NAME:-opspilot}
+  OPSPILOT_DB_USER: ${OPSPILOT_DB_USER:-opspilot}
+  OPSPILOT_DB_PASSWORD: ${OPSPILOT_DB_PASSWORD:?set OPSPILOT_DB_PASSWORD in the env file}
+  OPSPILOT_TEST_DB_NAME: ${OPSPILOT_TEST_DB_NAME:-opspilot_test}
+  OPSPILOT_SECRET_KEY: ${OPSPILOT_SECRET_KEY:?set OPSPILOT_SECRET_KEY in the env file}
+  OPSPILOT_ACCESS_TOKEN_TTL: ${OPSPILOT_ACCESS_TOKEN_TTL:-3600}
+  OPSPILOT_LOGIN_MAX_FAILURES: ${OPSPILOT_LOGIN_MAX_FAILURES:-10}
+  OPSPILOT_LOGIN_WINDOW_SECONDS: ${OPSPILOT_LOGIN_WINDOW_SECONDS:-300}
+  OPSPILOT_MASTER_KEY: ${OPSPILOT_MASTER_KEY:?set OPSPILOT_MASTER_KEY in the env file}
+  OPSPILOT_LEASE_SECONDS: ${OPSPILOT_LEASE_SECONDS:-30}
+  OPSPILOT_HEARTBEAT_SECONDS: ${OPSPILOT_HEARTBEAT_SECONDS:-5}
+  OPSPILOT_WORKER_CONCURRENCY: ${OPSPILOT_WORKER_CONCURRENCY:-2}
+  OPSPILOT_WORKER_ID: ${OPSPILOT_WORKER_ID:-compose-worker-1}
+  OPSPILOT_SSH_USER: ${OPSPILOT_SSH_USER:-}
+  OPSPILOT_SSH_CONNECT_TIMEOUT: ${OPSPILOT_SSH_CONNECT_TIMEOUT:-10}
+  OPSPILOT_SSH_COMMAND_TIMEOUT: ${OPSPILOT_SSH_COMMAND_TIMEOUT:-600}
+  OPSPILOT_HEALTHCHECK_TIMEOUT: ${OPSPILOT_HEALTHCHECK_TIMEOUT:-30}
+  OPSPILOT_ARTIFACT_ALLOWED_HOSTS: ${OPSPILOT_ARTIFACT_ALLOWED_HOSTS:-}
+  OPSPILOT_HEALTHCHECK_ALLOWED_CIDRS: ${OPSPILOT_HEALTHCHECK_ALLOWED_CIDRS:-127.0.0.0/8}
+  OPSPILOT_LOG_RETENTION_DAYS: ${OPSPILOT_LOG_RETENTION_DAYS:-30}
+  OPSPILOT_LOG_MAX_BYTES_PER_RUN: ${OPSPILOT_LOG_MAX_BYTES_PER_RUN:-10485760}
+  OPSPILOT_TELEGRAM_BOT_TOKEN: ${OPSPILOT_TELEGRAM_BOT_TOKEN:-}
+  OPSPILOT_TELEGRAM_CHAT_ID: ${OPSPILOT_TELEGRAM_CHAT_ID:-}
+
+services:
+  # --- metadata store ------------------------------------------------------
+  # MySQL 8.0, matching the README "MySQL 版本偏差" section: the code targets
+  # the 8.0/8.4 intersection and is verified on 8.0.46. This container is the
+  # quickstart's stand-in for the MySQL a real deployment already has.
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in the env file}
+      MYSQL_DATABASE: ${OPSPILOT_DB_NAME:-opspilot}
+      MYSQL_USER: ${OPSPILOT_DB_USER:-opspilot}
+      MYSQL_PASSWORD: ${OPSPILOT_DB_PASSWORD:?set OPSPILOT_DB_PASSWORD in the env file}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+    volumes:
+      - opspilot-mysql:/var/lib/mysql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysql -h127.0.0.1 -uroot -p"$$MYSQL_ROOT_PASSWORD" -e 'SELECT 1' >/dev/null
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+    restart: unless-stopped
+
+  # --- one-shot schema -----------------------------------------------------
+  # `alembic upgrade head` is a no-op when already at head. Kept out of the
+  # api/worker entrypoints on purpose: the app must never run DDL as a side
+  # effect of starting. On a real host you run this by hand (README §6).
+  init:
+    build:
+      context: .
+      target: api
+      args: *build-args
+    environment: *app-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  # --- API ----------------------------------------------------------------
+  api:
+    build:
+      context: .
+      target: api
+      args: *build-args
+    environment:
+      <<: *app-env
+      # Inside the stack these are not the host defaults.
+      OPSPILOT_API_HOST: 0.0.0.0
+    expose:
+      - "8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # --- Worker -------------------------------------------------------------
+  # Independent process, same image, never imports backend.app (that boundary
+  # is enforced by worker/tests/test_worker_boundary.py).
+  worker:
+    build:
+      context: .
+      target: api
+      args: *build-args
+    command: ["python", "-m", "worker.main"]
+    environment: *app-env
+    depends_on:
+      db:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- frontend + reverse proxy -------------------------------------------
+  web:
+    build:
+      context: .
+      target: web
+      args: *build-args
+    ports:
+      - "${OPSPILOT_QUICKSTART_PORT:-8088}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  opspilot-mysql:

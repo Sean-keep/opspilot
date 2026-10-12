@@ -3,20 +3,47 @@
 自托管的 Web 运维控制台：通过浏览器管理多台 Ubuntu / Debian Linux 服务器，做软件环境安装、
 Python 业务应用发布、服务管理、任务编排、健康检查、发布记录、失败恢复与审计。
 
-**当前阶段：S0 → S4 全部交付完毕。**
+**S0 → S4 全部交付完毕。**
 S0（工程初始化）→ S1（服务器资产）→ S2（任务引擎）→ S3（模板协议）→ S4（Python + systemd
 应用发布链路 / 健康检查 / 版本目录）已逐阶段收口，每个阶段收口时主分支始终可运行、可测试。
 S5（多机批次回滚、制品仓库、`keep_releases` 清理）不在本次范围内。
+
+| 我想… | 去哪 |
+|---|---|
+| 5 分钟先跑起来看看 | [5 分钟跑起来](#5-分钟跑起来compose-快速体验可选) |
+| 知道哪些事绝对不能做 | [硬约束](#硬约束) |
+| 在开发机上从零装一遍 | [本地开发](#本地开发) |
+| 部署到生产（systemd） | [Ubuntu systemd 部署](#ubuntu-systemd-部署) |
+| 跑测试 / lint / 类型检查 | [测试](#测试) |
+| 看架构与状态机 | [文档](#文档) |
+| 看每个阶段真实跑出来的结果 | [收口记录](#s0-收口记录) |
 
 ---
 
 ## 硬约束
 
-这些是设计文档的明令禁止项，代码、依赖、文档、部署流程都不允许违反：
+这些是设计文档的明令禁止项，代码、依赖、文档、**产品的远程执行与生产部署流程**都不允许违反：
 
-1. **不使用容器**。不引入 Docker、Docker Compose、Kubernetes，也不依赖任何容器化的开发或
-   部署流程。进程由 systemd 托管，依赖由 apt / pip / npm 安装。
-   交付自查：`find . -iname '*docker*' -o -iname 'Dockerfile*' -o -iname 'docker-compose*'` 必须为空。
+1. **产品的运维动作与生产部署不用容器**。远端操作、依赖安装、服务托管一律走
+   apt / pip / npm + systemd，**绝不引入 Kubernetes / Helm / Operator**，也绝不把容器
+   写进 Action Registry 的任何一条执行路径。
+
+   仓库里的 `Dockerfile` / `docker-compose.yml` / `.dockerignore` **只是本地快速体验的入口**
+   （见下节），不承载生产流量、不参与任何一次远程执行。设计文档原文要求「不引入 Docker、
+   Docker Compose、Kubernetes 或依赖容器的开发流程」；本次按你确认的口径收窄为
+   **生产与产品的运维动作不用容器**，快速体验文件是唯一的例外，且被上面几条限制锁死。
+
+   交付自查：
+
+   ```bash
+   # 只允许这三个快速体验文件，多一个就改错了
+   find . \( -path ./node_modules -o -path ./.venv -o -path ./frontend/node_modules \) -prune \
+       -o \( -iname '*docker*' -o -iname 'Dockerfile*' -o -iname 'docker-compose*' \) -print
+   # → ./.dockerignore  ./Dockerfile  ./docker-compose.yml
+
+   # K8s / Helm 一律为空
+   find . \( -iname '*k8s*' -o -iname '*kubernetes*' -o -name 'Chart.yaml' -o -name 'values.yaml' \) -print
+   ```
 2. **不以 root 执行任意 Shell**。远端操作只走 Action Registry 白名单；命令与参数分离（argv
    列表），从不 `shell=True`、从不字符串拼接。默认非 root SSH。
 3. **不覆盖已存在的数据目录**。MySQL / Redis 等的 datadir 一旦存在就拒绝初始化；不清空、
@@ -25,6 +52,90 @@ S5（多机批次回滚、制品仓库、`keep_releases` 清理）不在本次�
    原始私钥或明文密码。
 5. **不伪造测试结果**。每阶段报告真正跑过的命令与真实输出。
 6. **危险操作可审计、有二次确认**。后端权限校验是安全边界；前端隐藏按钮不算访问控制。
+
+---
+
+## 5 分钟跑起来（Compose 快速体验，可选）
+
+> **这是体验入口，不是生产部署。** 产品的运行方式是 systemd + 裸机，见
+> [Ubuntu systemd 部署](#ubuntu-systemd-部署)。Compose 只是让人不用先装 MySQL 和 Node
+> 就能把界面点一遍。硬约束第 1 条对它同样有效：不许把它扩成 Kubernetes。
+
+前置：Docker 29+ 与 Docker Compose 插件（`docker compose version`）。
+
+### 1. 配置
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+填四个值（其余都有默认）：
+
+```bash
+OPSPILOT_DB_PASSWORD=$(python3 -c "import secrets; print(secrets.token_urlsafe(24))")
+MYSQL_ROOT_PASSWORD=$(python3 -c "import secrets; print(secrets.token_urlsafe(24))")
+OPSPILOT_SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(48))")
+OPSPILOT_MASTER_KEY=$(python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+```
+
+把这四行的输出写进 `.env`。**`.env` 已被 gitignore，绝不提交。**
+
+> 配置只走一个旋钮：`--env-file`。默认读 `.env`，想用别的文件就
+> `docker compose --env-file .env.quickstart up --build`，栈读的一定是你指定的那一份。
+
+### 2. 起来
+
+```bash
+docker compose up --build -d
+```
+
+编排会按顺序做：`db` 就绪 → `init` 跑 `alembic upgrade head`（已在 head 时是空操作）→
+`api` / `worker` 起 → `web` 暴露到 **<http://127.0.0.1:8088>**。
+
+> 8088 被别的服务占了就换一个：`OPSPILOT_QUICKSTART_PORT=8099` 写进 env 文件再 `up`。
+> 端口冲突的症状是 `web` 停在 `Created`，`docker inspect` 里写着
+> `Bind for 0.0.0.0:8088 failed: port is already allocated`。
+
+> **第一次 build 要下载整棵依赖树**（Python 侧 20 来个包，Node 侧 305 个包）。
+> 网络正常时几分钟；链接被限速时会长很多 —— 这条链路的耗时全在拉包上，不在本项目的代码上。
+>
+> 仓库默认走**官方源**（`pypi.org` / `registry.npmjs.org`），不内置任何镜像。确实拉不动时，
+> 在 env 文件里改这两个**只影响 build** 的键：
+>
+> ```dotenv
+> PIP_INDEX_URL=https://your.pypi.mirror/simple
+> NPM_CONFIG_REGISTRY=https://your.npm.mirror/
+> ```
+>
+> 一个真实的坑，记在这里免得下次再撞：`npm ci` 对**下载失败的 optional 依赖是静默跳过**的。
+> Vite 8 的 rolldown 是按平台拆的 optional 原生绑定，掉一个就变成
+> `Cannot find module '@rolldown/binding-linux-x64-gnu'` —— 报错在打包器深处，离原因很远。
+> 所以 `Dockerfile` 在 `npm ci` 之后先 `import('rolldown')` 验一遍，缺了就当场说清楚。
+
+### 3. 建管理员
+
+```bash
+docker compose exec api python scripts/bootstrap.py --admin-password '<一个足够长的密码>'
+```
+
+只在管理员不存在时创建，**绝不重置已存在账号的密码**。密码 ≥ 12 位且不在弱口令表里。
+
+### 4. 用
+
+浏览器开 <http://127.0.0.1:8088>，用刚才的账号登录。
+
+- 想跑真远程任务（服务器检查 / 发布），还得接入一台 SSH 目标，见
+  [SSH 测试目标](#ssh-测试目标s1s4-用)。
+- 想跑测试，**不要在容器里跑** —— 集成测试要连真 MySQL 并清空 `opspilot_test`，
+  见 [测试](#测试)。
+
+### 收摊
+
+```bash
+docker compose down          # 停容器，保留数据卷
+docker compose down -v       # 连数据卷一起删（会丢库，确认后再用）
+```
 
 ---
 
@@ -63,13 +174,16 @@ backend/app/
   artifacts/     S4 制品
   notifications/ Telegram 等
 worker/          独立 Worker 进程（与 API 同库、独立部署）
-shared/          跨进程共享包：redaction、schemas、task_protocol、actions
+shared/          跨进程共享包：redaction、schemas、task_protocol、actions、config
 frontend/        Vue 3 控制台
 migrations/      Alembic 版本化迁移
 templates/       模板目录（runtime / web / application / database / middleware）
 scripts/         安装、预检、引导脚本（不是模板执行器）
 docs/            架构、数据库、状态机、模板协议、安全模型、安装
-systemd/         单元文件
+systemd/         生产用单元文件
+deploy/          快速体验用的 nginx 反代配置（非生产）
+Dockerfile       快速体验镜像（可选，见硬约束 1）
+docker-compose.yml  快速体验编排（可选，见硬约束 1）
 ```
 
 `shared/` 是可 import 的 Python 包，backend 与 worker 都依赖它，**反向绝不 import backend** ——
@@ -82,8 +196,8 @@ API 与 Worker 因此可以独立进程部署，又不拆微服务、不产生�
 设计文档写的是 **MySQL 8.4**。Ubuntu 24.04 (noble) 的官方 apt 仓里只有
 **`mysql-server-8.0 8.0.46-0ubuntu0.24.04.4`**。
 
-**本项目按 8.0 兼容编写，并在 8.0.46 上验证**，不为此引入第三方 apt 源、不使用容器。
-所有 SQL 特性都取 8.0 / 8.4 交集：
+**本项目按 8.0 兼容编写，并在 8.0.46 上验证**，不为此引入第三方 apt 源去追 8.4。
+Compose 快速体验里用的也是 `mysql:8.0`，与开发/生产同版本。所有 SQL 特性都取 8.0 / 8.4 交集：
 
 - InnoDB、`utf8mb4`、`utf8mb4_0900_ai_ci`
 - `BIGINT UNSIGNED` 主键
@@ -343,7 +457,14 @@ OPSPILOT_TEST_SSH_KEY_FILE=/etc/opspilot/ssh-test/opstest_ed25519
 
 ---
 
-## S0 收口记录
+## 收口记录
+
+以下四节是各阶段收口时**真实跑过**的命令与输出，逐字留档，不回填、不美化。
+其中 `find . -iname '*docker*' … → 空` 是当时的事实；S4 交付之后按确认口径加了
+Compose 快速体验文件，**这条自查的现状以硬约束第 1 条为准**（只允许三个快速体验文件）。
+其余门禁命令与结果不受影响。
+
+### S0 收口记录
 
 真实命令与结果见交付说明。门禁命令：
 
@@ -359,7 +480,7 @@ find . -iname '*docker*' -o -iname 'Dockerfile*' -o -iname 'docker-compose*'
 
 ---
 
-## S1 收口记录
+### S1 收口记录
 
 在 S0 之上新增：服务器资产、加密凭据、SSH 主机密钥信任链、只读系统检查与事实快照、
 对应的前端页面。门禁命令与 S0 相同，结果：
@@ -377,7 +498,7 @@ find . -iname '*docker*' -o -iname 'Dockerfile*' -o -iname 'docker-compose*'
 
 ---
 
-## S2 收口记录
+### S2 收口记录
 
 在 S1 之上新增：任务 / Run / Step / 日志四张表与 Outbox、独立 Worker（原子认领 + 租约
 心跳 + 过期恢复）、取消证据、`UNKNOWN` 人工裁定、SSE 事件流、任务列表与详情页。
@@ -418,7 +539,7 @@ S2 新增的并发与恢复测试（都在真 MySQL 上跑）：
 
 ---
 
-## S3 收口记录
+### S3 收口记录
 
 在 S2 之上新增：模板目录与加载器、15 个 V1 动作的 Action Registry、严格模式参数渲染、
 模板四层拒绝、版本生命周期与不可变发布、模板目录 API、5 个示例模板（各带校验与幂等测试）。
@@ -483,7 +604,7 @@ S3 新增测试的分工：
 
 ---
 
-## S4 收口记录
+### S4 收口记录
 
 在 S3 之上新增：应用 / 环境定义、发布与回滚记录、`shared/deploy_plan.py` 的 §8.2 计划、
 第 16 个动作 `app.switch_current`、Worker 侧的发布执行与失败恢复、应用与发布记录两个前端页面。
@@ -538,7 +659,7 @@ S4 新增测试的分工（文件内总数，含 S3 累积）：
 | `backend/tests/test_deployments_api.py` | 25 | 钉版本、校验和、SSRF、环境互斥、`previous_release_id` 的推导、密钥不进任务行、回滚二次确认、幂等回放 |
 | `backend/tests/test_worker_deploy.py` | 18 | 切换前失败停批、切换后失败放回旧版本、首次发布失败无处可放、密文只进 env 文件、切换幂等、记录生命周期 |
 
-### S4 端到端演练与抓到的 bug
+#### S4 端到端演练与抓到的 bug
 
 一次真实发布（本地 `opstest` SSH 目标 + 真 systemd + 真 MySQL）跑通了 §8.2 的 11 步：
 
@@ -618,3 +739,89 @@ worker 日志里的两条恢复事件：
 - 制品是拉取 URL + SHA-256，仓库本身不在 V1（`backend/app/artifacts/` 还是空模块）。
 - `system.check_os` 的平台词汇表写进了 `docs/deployment.md`；设计文档里没有这一节，
   但 expect 的取值必须和 `/etc/os-release` 的解析结果对齐，否则整条发布链路起不来。
+
+---
+
+### Compose 快速体验收口（本次）
+
+在 S4 之后按确认口径加的：**Compose 只做本地快速体验入口，生产与产品的运维动作仍不用容器**
+（硬约束第 1 条已改写，见上）。新增四个文件：`Dockerfile` / `docker-compose.yml` /
+`.dockerignore` / `deploy/quickstart-nginx.conf`。**没有 Kubernetes / Helm / Operator，也不许有。**
+
+#### 门禁（在改完 Compose 与 README 后重跑，真实结果）
+
+- `alembic upgrade head` 连跑两次 → 第二次无 `Running upgrade`
+- `pytest backend/tests worker/tests shared/tests templates` → **673 passed, 1 warning in 506.92s**
+- `ruff check .` → All checks passed!
+- `mypy backend worker shared templates` → Success: no issues found in 135 source files
+- `cd frontend && npm run lint` / `typecheck` / `test`（**38 passed**，6 个测试文件）→ 全绿
+
+#### Compose 栈真跑起来（`docker compose --env-file … up --build -d`）
+
+```
+opspilot-db-1      mysql:8.0        Up (healthy)
+opspilot-init-1    alembic upgrade  Exited (0)          ← 第二次跑时无 "Running upgrade"
+opspilot-api-1     uvicorn          Up (healthy)
+opspilot-worker-1  worker.main      Up                   ← worker.starting / worker.idle
+opspilot-web-1     nginx            Up  0.0.0.0:8099->80/tcp
+```
+
+打的是 nginx 的 8099（本机 8088 被别的服务占了），链路是 浏览器 → nginx → `api:8080`：
+
+```
+GET  /healthz                    → 200  {"status":"ok","database":"ok"}
+GET  /readyz                     → 200  {"status":"ready","database":"ok"}
+GET  /                           → 200  <title>OpsPilot</title>
+GET  /servers                    → 200  （SPA fallback）
+POST /api/v1/auth/login          → 200  access_token + 31 个权限码
+GET  /api/v1/auth/me             → 200  （带 Bearer）
+GET  /api/v1/servers             → 200  []
+GET  /api/v1/servers   （无 token）→ 401  {"code":"unauthenticated","message":"missing bearer token","request_id":…}
+```
+
+`scripts/bootstrap.py` 跑了两遍，第二遍必须是空操作：
+
+```
+第 1 遍：{"permissions_created": 31, "roles_created": 3, …, "event": "bootstrap.admin_created"}
+第 2 遍：{"permissions_created": 0,  "roles_created": 0, …, "event": "bootstrap.admin_exists",
+          "admin_created": false}
+```
+
+第二遍给的另一个密码**没有生效**：原密码仍 200，新密码 401 —— 「只在管理员不存在时创建，
+绝不重置已存在账号的密码」是实测的，不是文档措辞。
+
+api / worker 日志里 `grep -icE 'BEGIN [A-Z ]*PRIVATE|access_token|eyJhbGciOi|<刚才那个密码>'` → **0**。
+
+#### 冒烟里抓到的两个坑（都修了，记在这里免得下次再撞）
+
+1. **`npm ci` 对下载失败的 optional 依赖是静默跳过的。** Vite 8 的 rolldown 是按平台拆的
+   optional 原生绑定，掉一个就变成 `Cannot find module '@rolldown/binding-linux-x64-gnu'` ——
+   报错在打包器深处，离原因很远，看起来像 Dockerfile 写错了。现在 `npm ci` 带
+   `--fetch-retries=5`，装完先 `import('rolldown')` 验一遍，缺了就当场说清楚。
+2. **端口被占的症状是 `web` 停在 `Created`。** `docker inspect` 里才有
+   `Bind for 0.0.0.0:8088 failed: port is already allocated`，`compose ps` 只写 `Created`。
+   换 `OPSPILOT_QUICKSTART_PORT` 即可。
+
+**另外，registry 是两个 build-arg，默认官方源。** 仓库不内置任何镜像：
+
+```dotenv
+#PIP_INDEX_URL=https://pypi.org/simple
+#NPM_CONFIG_REGISTRY=https://registry.npmjs.org/
+```
+
+本次冒烟是在拉不动官方源的网络上做的，所以把这两个键指向了可达的镜像才把 build 跑完。
+**默认值仍是官方源**，这一点没有因为「本机跑不动」而改。
+
+#### 红线自查（交付前逐字跑过）
+
+```bash
+find . \( -path ./node_modules -o -path ./.venv -o -path ./frontend/node_modules \) -prune \
+    -o \( -iname '*docker*' -o -iname 'Dockerfile*' -o -iname 'docker-compose*' \) -print
+# → ./.dockerignore
+#   ./Dockerfile
+#   ./docker-compose.yml
+
+find . \( -path ./node_modules -o -path ./.venv -o -path ./frontend/node_modules \) -prune \
+    -o \( -iname '*k8s*' -o -iname '*kubernetes*' -o -name 'Chart.yaml' -o -name 'values.yaml' \) -print
+# → （空）
+```
