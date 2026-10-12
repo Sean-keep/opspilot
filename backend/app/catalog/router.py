@@ -17,8 +17,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import Depends
 
+from backend.app.api.routing import AppRouter
 from backend.app.audit.service import write_audit
 from backend.app.auth.deps import DbSession, require_permission
 from backend.app.auth.models import User
@@ -32,7 +33,7 @@ from backend.app.catalog.schemas import (
 from backend.app.catalog.service import CatalogService, InvalidTransition, TemplateConflict
 from backend.app.core.errors import Conflict, NotFound
 
-router = APIRouter(prefix="/templates", tags=["catalog"])
+router = AppRouter(prefix="/templates", tags=["catalog"])
 
 CanRead = Annotated[User, Depends(require_permission("template.read"))]
 CanValidate = Annotated[User, Depends(require_permission("template.validate"))]

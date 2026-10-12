@@ -72,9 +72,24 @@ INSERT 时写一次**。MySQL 表达不了「这些列禁止 UPDATE」（除非�
 一旦离开 `DRAFT` 正文即冻结 —— `VALIDATED` / `TESTED` 是对**某一版正文**的结论，在这些状态
 下换正文等于把结论作废。
 
-### S4
+### S4 已落地（迁移 `0005` + `0006`）
 
-`ops_applications`、`ops_app_environments`、`ops_deployments`
+| 表 | 用途 |
+|---|---|
+| `ops_applications` | 应用定义。`name` 是**目录段**（`/opt/opspilot/apps/<name>/`），小写 slug，`releases` / `shared` / `current` 三个保留名被服务层拒绝 |
+| `ops_app_environments` | 应用内的可发布环境（`test` / `staging` / `production`）。`config_ref` 只存引用（`cred:<id>`），**不存值**；`service_name` + `unit_path` 必须成对出现 |
+| `ops_deployments` | 一次发布记录。`kind` ∈ DEPLOY/ROLLBACK，`status` ∈ PENDING/RUNNING/SUCCEEDED/FAILED/ROLLED_BACK/CANCELLED。`rollback_of` 指向被撤销的那条 |
+
+`ops_deployments` 的两个设计点：
+
+- **`previous_release_id` 是提交时刻从「该环境上一条 SUCCEEDED 的发布」算出来的**，不是从
+  最后一次尝试算。一次在切换前就失败的部署没有动过线上版本，它的 `release_id` 不该成为
+  「上一个版本」。
+- **回滚是一条新记录**（`kind=ROLLBACK`，`rollback_of=<原记录>`），不改写原记录的 `status`。
+  历史要说清「发生了什么」和「操作员随后做了什么」，这两件事不能混成一列。
+
+迁移 `0006` 只改一件事：`ops_tasks.idempotency_key` 从 `NOT NULL DEFAULT ''` 变成
+`NULL DEFAULT NULL`。原因见下节。
 
 ## 关键唯一约束
 
@@ -89,8 +104,26 @@ INSERT 时写一次**。MySQL 表达不了「这些列禁止 UPDATE」（除非�
 | `ops_permissions.code` UNIQUE | 权限码是稳定词汇表 |
 | `ops_templates.name` UNIQUE | 模板名全局唯一，跨分类也不重复 |
 | `ops_template_versions` UNIQUE `(template_id, version)` | 一个版本号只指一份正文 |
+| `ops_applications.name` UNIQUE | 应用名是目录段，重名会在同一台机器上撞目录 |
+| `ops_app_environments` UNIQUE `(application_id, name)` | 一个应用里同名环境只有一个 |
 
 S2 的三条任务约束各有集成测试直接撞库断言 `IntegrityError`，不是「应该有」的注释。
+
+### `idempotency_key` 的 NULL 规则（迁移 `0006`）
+
+第一版列是 `VARCHAR(128) NOT NULL DEFAULT ''`，UNIQUE。InnoDB 的 UNIQUE 允许多个 `NULL`、
+只禁止重复的非 `NULL` 值 —— 而 `''` 是一个非 `NULL` 值。于是**整张表只能有一条不带
+`Idempotency-Key` 的任务**：第二次无 key 提交直接撞 `IntegrityError`，API 返回 500。
+
+现在的语义是：
+
+| 存的值 | 含义 | UNIQUE 行为 |
+|---|---|---|
+| `NULL` | 调用方没有要求去重 | 可以有任意多条 |
+| `'some-key'` | 要求去重 | 只能有一条 |
+
+`TaskService.create()` 存 `key or None`，`to_out` 读出 `or ""`，所以对外的形状没变。
+`downgrade()` **不**把已有 `NULL` 写回 `''` —— 那会把它们全撞到同一个唯一值上。
 
 ## 迁移策略
 

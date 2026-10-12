@@ -3,9 +3,10 @@
 自托管的 Web 运维控制台：通过浏览器管理多台 Ubuntu / Debian Linux 服务器，做软件环境安装、
 Python 业务应用发布、服务管理、任务编排、健康检查、发布记录、失败恢复与审计。
 
-**当前阶段：S3 —— 模板协议 / Action Registry / 模板校验与示例模板。**
-S0（工程初始化）→ S1（服务器资产）→ S2（任务引擎）已完成；S4（应用发布）待做。
-按阶段交付，每个阶段收口时主分支始终可运行、可测试。
+**当前阶段：S0 → S4 全部交付完毕。**
+S0（工程初始化）→ S1（服务器资产）→ S2（任务引擎）→ S3（模板协议）→ S4（Python + systemd
+应用发布链路 / 健康检查 / 版本目录）已逐阶段收口，每个阶段收口时主分支始终可运行、可测试。
+S5（多机批次回滚、制品仓库、`keep_releases` 清理）不在本次范围内。
 
 ---
 
@@ -198,8 +199,8 @@ npm run build
 mock 出绿色。`SKIP LOCKED`、utf8mb4 排序规则、`DATETIME(3)`、唯一约束行为在 SQLite 上都不等价，
 所以测试库必须是真 MySQL。
 
-**当前 S3 实测结果**（见下方「S3 收口记录」）：`pytest` 549 passed、`ruff` 通过、`mypy` 120 files
-通过、前端 lint/typecheck/build 全部通过。
+**当前 S4 实测结果**（见下方「S4 收口记录」）：`pytest` 673 passed、`ruff` 通过、`mypy` 135 files
+通过、前端 lint/typecheck/test/build 全部通过。
 
 ---
 
@@ -273,31 +274,41 @@ journalctl -u opspilot-api -n 50 --no-pager
 | [docs/database.md](docs/database.md) | 表设计、迁移策略、约定 |
 | [docs/state-machines.md](docs/state-machines.md) | 任务 / Run / Step 状态机、取消与恢复 |
 | [docs/template-protocol.md](docs/template-protocol.md) | 模板格式、Action Registry、参数渲染 |
+| [docs/deployment.md](docs/deployment.md) | 发布计划、原子切换、恢复策略、密钥走向 |
 | [docs/security-model.md](docs/security-model.md) | 威胁模型、认证、RBAC、脱敏、已知限制 |
 | [docs/local-install.md](docs/local-install.md) | 本机从零到可用的完整步骤 |
 
 ---
 
-## 已知限制（S2）
+## 已知限制（S4）
 
 - 登录失败限速计数在**进程内存**里。API 以单进程跑在 systemd 下时够用；若将来水平扩展，
   需要把计数挪到 MySQL。见 `docs/security-model.md`。
 - 凭据目前只支持 `ssh_key` 做连通性检查；`ssh_password` / `sudo_password` 已能存取，
-  使用它们的通道在 S3 的 Action Registry 里接。
+  使用它们的通道在 Action Registry 里接。
 - **API 进程不碰凭据、不开命令通道。** `POST /servers/{id}/check` 只做前置检查并入队，
   解密与 SSH 全在 Worker。唯一的例外是 `discover_host_key`：未认证的公钥握手，不取凭据、
   不执行命令，必须留在 API 才能让操作员当场确认指纹。
 - SSE 的 token 走查询参数（`EventSource` 设不了请求头）。该端点只读，且后端单独校验
   `task.read`。见 `docs/security-model.md`。
-- 取消只停后续步骤，**不回滚**。回滚是独立任务，S4 才有 `POST /deployments/{id}/rollback`。
+- 取消只停后续步骤，**不自动回滚**。回滚是独立的发布记录（`POST /deployments/{id}/rollback`），
+  由操作员显式发起并二次确认。
+- **回滚只做到「能创建回滚任务」。** 单条记录对应一次任务、每台目标机一个 Run；多机批次
+  的联动回滚、以及「整批失败就整批回滚」的策略是 S5。
+- 环境互斥（同一应用环境同时只允许一条未终结发布）在并发下是**建议性**的，不是数据库
+  级排它锁。两个同时通过检查的请求都能插进去。见 `docs/deployment.md`。
+- 发布制品是**拉取 URL + SHA-256**，仓库本身不在 V1 里（`backend/app/artifacts/` 还是空模块）。
+  校验和不符就拒绝解压。
+- `keep_releases` 只是保留条数的提示，**还没有清理动作**。`releases/<id>` 只追加；
+  `shared/data` 永不自动清理 —— 这两条都是刻意的。
 - 模板在 V1 里**不能出现字面 `$`**。严格渲染器拒绝 `${...}` / `$(...)` / 反引号，而 nginx
   之类的配置又要写 `$host`。V1 选择安全优先：需要字面 `$` 的配置文件暂不能用模板渲染，
   改用 `file.render` 的 `content` 原文（里面 `$host` 是允许的，因为被拒绝的只是 `${`、`$(`、
   `` ` `` 三种形态）。见 `docs/template-protocol.md`。
-- 模板的 `release_id` 保留字 `latest` / `current` / `shared` / `releases` 一律拒绝，强制钉版本。
-- 应用发布链路尚未实现（S4）。
-- 前端有登录、外壳、健康状态、服务器、凭据、任务（列表 + 详情）六个页面；模板 / 应用 /
-  发布记录 / 审计日志仍标注「即将开放」。
+- `release_id` / `release_version` 的保留字 `latest` / `current` / `shared` / `releases` / `ops`
+  一律拒绝，强制钉版本 —— 不只在生产。
+- 前端有登录、外壳、健康状态、服务器、凭据、任务（列表 + 详情）、应用、发布记录八个页面；
+  模板 / 审计日志仍标注「即将开放」。
 
 ---
 
@@ -310,7 +321,9 @@ journalctl -u opspilot-api -n 50 --no-pager
 sudo bash scripts/setup-ssh-test-target.sh
 ```
 
-脚本会创建 `/opt/opspilot/apps` 与 `/opt/opspilot-test`（属主 `opstest`，写入不需要 sudo），
+脚本会创建 `/opt/opspilot/apps` 与 `/opt/opspilot/test`（属主 `opstest`，写入不需要 sudo；
+后者是 `systemd.render_unit` 暂存 unit 正文的 scratch 目录，与 `ALLOWED_PATH_PREFIXES`
+里的 `/opt/opspilot/test/` 一致），
 把私钥放在 `/etc/opspilot/ssh-test/opstest_ed25519`（mode 600），并在
 `/etc/sudoers.d/opspilot-opstest` 里只放行 `systemctl` 查询/重启、unit 安装到
 `/etc/systemd/system/`、以及 `/opt/opspilot/apps` 下的软链切换。**不放行** `chmod` /
@@ -467,3 +480,141 @@ S3 新增测试的分工：
   「跑过模板自带测试」在 V1 是操作员的判断，不是 CI 回写。
 - 模板里的 `secret_ref` 语法已在协议文档里定义，但 V1 的 5 个示例模板都没用到它 ——
   真正接凭据解析在 S4 的发布链路里。
+
+---
+
+## S4 收口记录
+
+在 S3 之上新增：应用 / 环境定义、发布与回滚记录、`shared/deploy_plan.py` 的 §8.2 计划、
+第 16 个动作 `app.switch_current`、Worker 侧的发布执行与失败恢复、应用与发布记录两个前端页面。
+
+**S4 的三条收口：**
+
+1. **计划在提交时就组一遍。** `build_deploy_plan()` 在 API 侧跑一次：组装不出来的提交
+   （可变别名、缺校验和、SSRF 形状的制品地址）不会被记成一条发布，而不是跑三步之后才炸。
+   Worker 用同一份输入重建同一份计划 —— 批下来的，就是跑的。
+2. **密钥从不进任务行。** 任务的 `params` 里只有 `config_ref`（与 `deploy` 平级），值由 Worker
+   在执行时从 `ops_credentials` 解析。API 内存里、任务行里、步骤参数里、日志里都不出现明文配置。
+   回滚重写 env 文件，所以它从被撤销那条发布的任务参数继承**非密文**的 `config` / `module_name` /
+   `app_port` / `python_version` / `requirements`，否则一次回滚会把操作员填过的配置抹掉。
+3. **不归零点是 `switch_current`。** 切换前失败 → 停批，线上不动，记录 `FAILED`；
+   切换这一步或之后失败 → 跑恢复计划把旧版本放回去，记录 `ROLLED_BACK`；
+   首次发布失败且无处可放回 → `FAILED` 并写明「链路已翻且无版本可放回」，不假装没事。
+   切换本身是 `ln -s` + `mv -Tf`，**绝不 `rm` 旧链接再 `ln`**（那个窗口里 `current` 不存在）。
+
+**两个真实的 bug，在 S4 测试里抓到并修掉：**
+
+- **`ops_tasks.idempotency_key` 的 `''` 唯一值陷阱。** 列原本是 `NOT NULL DEFAULT ''` + UNIQUE。
+  InnoDB 允许多个 `NULL`、只禁重复的非 `NULL` 值，而 `''` 是非 `NULL` —— 于是**整张表只能有一条
+  不带 `Idempotency-Key` 的任务**，第二次无 key 提交直接 `IntegrityError` → 500。迁移
+  **`0006_task_idempotency_nullable`** 把列改成 `NULL DEFAULT NULL` 并把已有 `''` 归一成 `NULL`；
+  UNIQUE 索引不动（NULL 彼此不冲突，正是要的语义）。`downgrade()` 刻意不把 `NULL` 写回 `''`
+  —— 那会让它们全撞到同一个值上。
+- **`system.check_os` 永远匹配不上。** 原来是 `any(token in stdout for token in expect)`，
+  而 `ubuntu-24.04` **不是** `/etc/os-release` 任何一行的子串，真实机器上每次检查都失败。
+  现在解析出 `ID` / `VERSION_ID` 拼成 `ubuntu-24.04` / `debian-12` 再比对（`<ID>` 也接受）。
+  这同时救回了 `templates/runtime/python312` 等用同一份 expect 的模板。
+
+**另一个修掉的接缝：** Worker 原来从 `deploy` 映射里找 `config_ref`，而 API 把它写在任务参数
+顶层 —— 密钥永远到不了目标机。现在两边约定一致：顶层 `config_ref`，`deploy` 里没有它。
+
+门禁命令与 S0 相同（`pytest` 含 `templates`，`mypy` 含 `templates`），真实结果：
+
+- `alembic upgrade head` 连跑两次 → 第二次无 `Running upgrade`
+- `pytest backend/tests worker/tests shared/tests templates` → **673 passed, 1 warning in 412.64s**（S3 时 549）
+- `ruff check .` → All checks passed!
+- `mypy backend worker shared templates` → Success: no issues found in 135 source files（S3 时 120）
+- `cd frontend && npm run lint` / `typecheck` / `test`（**38 passed**，6 个测试文件）/ `build` → 全绿
+- `find . -iname '*docker*' …` → 空
+
+S4 新增测试的分工（文件内总数，含 S3 累积）：
+
+| 位置 | 数量 | 锁死了什么 |
+|---|---|---|
+| `shared/tests/test_actions.py` | 183 | 16 个动作的注入面、sudo / 路径白名单、stdin 载荷边界、`app.switch_current` 的 argv 形状与幂等跳过、`test` 探针真打 `/usr/bin/test` |
+| `shared/tests/test_deploy_plan.py` | 21 | 计划顺序与 `switch_index`、恢复计划的形状、`inputs_from_mapping` 拒绝未知字段、env 文件每键只写一次、与部署输入同名的 config 键拒绝 |
+| `backend/tests/test_task_engine.py` | 35 | `SKIP LOCKED` 并发认领、三个唯一约束、租约过期恢复、`UNKNOWN` 不被再认领、恢复后步骤行不再假装 `RUNNING` |
+| `backend/tests/test_applications_api.py` | 23 | 名字规范化与保留名、unit 路径、服务白名单、SSRF、不能改名、无 DELETE、viewer 只读 |
+| `backend/tests/test_deployments_api.py` | 25 | 钉版本、校验和、SSRF、环境互斥、`previous_release_id` 的推导、密钥不进任务行、回滚二次确认、幂等回放 |
+| `backend/tests/test_worker_deploy.py` | 18 | 切换前失败停批、切换后失败放回旧版本、首次发布失败无处可放、密文只进 env 文件、切换幂等、记录生命周期 |
+
+### S4 端到端演练与抓到的 bug
+
+一次真实发布（本地 `opstest` SSH 目标 + 真 systemd + 真 MySQL）跑通了 §8.2 的 11 步：
+
+```
+check_os / check_disk / ensure_user / ensure_runtime / fetch_release /
+install_release / render_config / render_unit / switch_current /
+restart_service / check_health        →  11/11 SUCCESS
+current -> releases/1.4.2
+curl http://127.0.0.1:8888/healthz  →  {"status":"ok"}
+```
+
+演练**故意**是找 bug 的，不是演示。抓到并修掉九个，都是测试替身报喜、真机才炸的那类：
+
+| # | bug | 症状（真机） | 为什么测试没拦住 |
+|---|---|---|---|
+| 1 | `app.fetch_release` 不建 `releases/` | `curl: (23) Failure writing output to destination` | 替身不检查父目录是否存在 |
+| 2 | `file.render` 不建父目录 | `dd: failed to open '…/.new'` | 同上 |
+| 3 | `systemd.render_unit` 的 scratch 目录写错 | `dd: failed to open '/opt/opspilot/test/…'`，脚本建的是 `/opt/opspilot-test` | 脚本与代码的路径各自「正确」，没对齐 |
+| 4 | `mkdir` 失败被丢掉 | 真实错误（`Permission denied`）被下一条 `dd` 的报错盖住 | 看起来只是 `dd` 失败 |
+| 5 | `_exists` 写成 `test -e -- path` | **每个存在性探针都返回「不存在」**：不备份、release 永远重解压、锁文件永远像缺失、`app.switch_current` 拒绝切换 | 见下 |
+| 6 | `systemd-analyze verify` 拒绝合法 unit | `ExecStart` 指向还没翻的 `current/...`，切换前必然不存在 | 只测过已切换的路径 |
+| 7 | `Scheduler._renew` 每次成功都告警 | `worker.lease_lost` 打在每条成功 run 上 | 断言只写了「丢了要报」，没写「没丢别报」 |
+| 8 | `apply_recovery` 不收尾步骤行 | run 已 `UNKNOWN`，步骤仍显示 `RUNNING`（谎称在跑） | 恢复测试只断言 run 状态 |
+| 9 | `render_env_file` 把 `APP_PORT` 写两遍 | `config: {"APP_PORT": "9999"}` + `app_port: 8888` 时，进程听 9999、健康检查探 8888 | 单测只用 `in body`，查不出重复 |
+
+**第 5 条是这批里最危险的。** POSIX 的 `test` 不把 `--` 当选项终结符：
+
+```
+$ /usr/bin/test -e -- /some/path
+test: '--': binary operator expected      # exit 2
+$ /usr/bin/test -e /some/path             # exit 0
+```
+
+三个操作数时 `test` 把 `$2` 当二元运算符 —— 报错退出 2，和「路径不存在」看起来一模一样。
+`readlink --` / `mkdir -p --` / `ln -s --` / `mv -Tf --` / `rm -f --` 都认 `--`（GNU coreutils），
+唯独 `test` 不认。它静默关掉了**所有**存在性探针：`file.render` 的备份、`install_release`
+的已装判断、`systemd.render_unit` 的备份、`mysql.precheck` 的 datadir 判断、
+`redis.precheck` 的配置判断、`app.switch_current` 的 release 判断，全是假的。
+
+它能活到真机，是因为测试替身对 `test` 一律回成功/失败的**罐头答案**，而罐头答案分不出
+「路径不在」和「argv 写错了」。回归测试换成 `RealTestPort`：真正 `exec` `/usr/bin/test`，
+断言 `present` 为真、`gone` 为假、argv 里没有 `--`。把修复改回去，该测试立刻红。
+
+**第 6 条的判定口径**是「语法检查」（文档原词）：`systemd-analyze verify` 同时做语法检查和
+「`ExecStart` 能不能解析」，后者在切换前**必然**失败，是合法的推迟，不是错误。现在
+`classify_verify_output` 把输出分成 `(problems, deferred)`：只有 `Command … is not executable`
+且路径含 `/current/` 才算 deferred；含 `ignoring` 的 systemd 警告丢弃；其余都是 problems。
+**空 stderr + 非零退出不算通过** —— 那是没解释的坏退出，不是好结果。
+
+**杀掉 worker 重启，任务状态可恢复**（计划里的收口项）在真机上验了两种形状，结论不同、都是设计如此：
+
+| 场景 | 杀在哪 | 租约过期后的判定 | 结果 |
+|---|---|---|---|
+| `server.check`（全是 `SAFE` 步骤） | `collect_facts` 正在跑 | `probe=finished` → **`requeued`** | 重排队，`attempt` 1→2，最终 `SUCCESS` |
+| `app.deploy`（含 `CONDITIONAL` / `DESTRUCTIVE`） | `ensure_user` 正在跑 | `probe=finished` → **`marked_unknown`** | run 停在 `UNKNOWN`，**不自动重跑**；`current` 仍指旧版本，线上没动 |
+
+worker 日志里的两条恢复事件：
+
+```json
+{"run_id": 7, "probe": "finished", "decision": "requeued",       "idempotency_class": "SAFE",        "event": "worker.lease_recovery"}
+{"run_id": 9, "probe": "finished", "decision": "marked_unknown", "idempotency_class": "CONDITIONAL", "event": "worker.lease_recovery"}
+```
+
+部署那条停在 `UNKNOWN` 是**对的**：`restart_service` 是 `DESTRUCTIVE`、`ensure_user` 是
+`CONDITIONAL`，而 `_precheck_target_state()` 在 V1 故意返回 `False` —— 宁可停下来叫人，
+也不猜「大概装完了吧」然后重跑一遍不可逆的步骤。单 run 的 `UNKNOWN` 按聚合规则折成任务
+`PARTIAL_SUCCESS`（跑完了，但要人看一眼），`UNKNOWN` 永远不折成 `SUCCESS`。
+
+**已知取舍（S4）：**
+
+- 回滚只做到「能创建回滚任务」。单条记录对应一次任务、每台目标机一个 Run；多机批次的
+  联动回滚、以及「整批失败就整批回滚」的策略是 S5。
+- 环境互斥（§10）在并发下是建议性的，不是数据库级排它锁。两个同时通过检查的请求都能插进去。
+  Worker 侧的逐步执行仍是最后一道防线。
+- `keep_releases` 只是保留条数的提示，还没有清理动作。`releases/<id>` 只追加；
+  `shared/data` 永不自动清理 —— 这两条都是刻意的。
+- 制品是拉取 URL + SHA-256，仓库本身不在 V1（`backend/app/artifacts/` 还是空模块）。
+- `system.check_os` 的平台词汇表写进了 `docs/deployment.md`；设计文档里没有这一节，
+  但 expect 的取值必须和 `/etc/os-release` 的解析结果对齐，否则整条发布链路起不来。

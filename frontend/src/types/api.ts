@@ -273,3 +273,154 @@ export interface CredentialOut {
   created_at: string
   updated_at: string
 }
+
+// ---------------------------------------------------------------------------
+// S4: applications, environments, deployments
+// ---------------------------------------------------------------------------
+
+/**
+ * An application is a definition, not a process. Its name becomes the
+ * directory segment under `/opt/opspilot/apps/`, so it is a lowercase slug and
+ * three of them (`releases`, `shared`, `current`) are reserved by the layout.
+ */
+export type AppRuntimeType = 'python'
+
+/** The three environments an application may define. */
+export type AppEnvironmentName = 'test' | 'staging' | 'production'
+
+/**
+ * One deployable target inside an application.
+ *
+ * `config_ref` is an *opaque reference* to a credential — `cred:<id>` — never
+ * the values themselves. The worker resolves it at execution time.
+ */
+export interface AppEnvironmentOut {
+  id: number
+  application_id: number
+  name: AppEnvironmentName
+  config_ref: string
+  service_name: string
+  unit_path: string
+  health_url: string
+  health_timeout_s: number
+  keep_releases: number
+}
+
+export interface ApplicationOut {
+  id: number
+  name: string
+  runtime_type: AppRuntimeType
+  repo_url: string
+  default_branch: string
+  run_user: string
+  description: string
+  environments: AppEnvironmentOut[]
+}
+
+export interface ApplicationCreateBody {
+  name: string
+  runtime_type?: AppRuntimeType
+  repo_url?: string
+  default_branch?: string
+  run_user?: string
+  description?: string
+}
+
+/** `name` is absent: renaming would rewrite every record that refers to it. */
+export interface ApplicationUpdateBody {
+  runtime_type?: AppRuntimeType
+  repo_url?: string
+  default_branch?: string
+  run_user?: string
+  description?: string
+}
+
+export interface AppEnvironmentCreateBody {
+  name: AppEnvironmentName
+  config_ref?: string
+  service_name?: string
+  unit_path?: string
+  health_url?: string
+  health_timeout_s?: number
+  keep_releases?: number
+}
+
+export interface AppEnvironmentUpdateBody {
+  config_ref?: string
+  service_name?: string
+  unit_path?: string
+  health_url?: string
+  health_timeout_s?: number
+  keep_releases?: number
+}
+
+export type DeploymentKind = 'DEPLOY' | 'ROLLBACK'
+
+/**
+ * `ROLLED_BACK` is not a polite spelling of `FAILED`: the attempt failed *and*
+ * the previous release was put back. A first deploy that fails after the
+ * switch has nothing to put back, so it reports `FAILED` and says so.
+ */
+export type DeploymentStatus =
+  | 'PENDING'
+  | 'RUNNING'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'ROLLED_BACK'
+  | 'CANCELLED'
+
+export interface DeploymentOut {
+  id: number
+  application_id: number
+  environment_id: number
+  kind: DeploymentKind
+  status: DeploymentStatus
+  release_version: string
+  release_id: string
+  previous_release_id: string
+  artifact_url: string
+  artifact_checksum: string
+  task_id: number | null
+  rollback_of: number | null
+  requested_by: string
+  error_detail: string
+  started_at: string | null
+  finished_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface DeployTargetBody {
+  server_id: number
+}
+
+/**
+ * A pinned release. `release_version` must be a concrete identifier — a tag, a
+ * commit, a build number. Mutable aliases (`latest`, `current`, …) are refused
+ * by the backend because a record that says "latest" cannot answer what is
+ * live tomorrow.
+ */
+export interface DeployCreateBody {
+  environment: AppEnvironmentName
+  release_version: string
+  artifact_url: string
+  artifact_checksum: string
+  targets: DeployTargetBody[]
+  module_name?: string
+  app_port?: number
+  python_version?: string
+  requirements?: string
+  /** Non-secret env entries. Secrets come from the environment's `config_ref`. */
+  config?: Record<string, string>
+}
+
+/**
+ * Rollback is a **new** deployment, never an edit. `confirm` must be true —
+ * the backend refuses anything that did not answer, so a hidden button is not
+ * the control.
+ */
+export interface RollbackCreateBody {
+  targets: DeployTargetBody[]
+  reason?: string
+  confirm: true
+}

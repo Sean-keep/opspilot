@@ -31,6 +31,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import ipaddress
+import posixpath
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
@@ -48,6 +49,7 @@ from shared.actions.base import (
 from shared.actions.params import (
     NonEmpty,
     OptionalUserName,
+    OptionalVersion,
     Packages,
     ReadPath,
     RemotePath,
@@ -58,6 +60,7 @@ from shared.actions.params import (
     tcp_port,
 )
 from shared.actions.render import validate_path
+from shared.checks import parse_os_release
 from shared.executor.port import ExecContext, ExecResult
 
 __all__ = [
@@ -65,6 +68,7 @@ __all__ = [
     "ALLOWED_SUDO_RULES",
     "ISOLATED_STATE_MARKERS",
     "check_service_allowed",
+    "classify_verify_output",
     "ensure_sudo_allowed",
 ]
 
@@ -108,6 +112,43 @@ ALLOWED_SUDO_RULES: tuple[str, ...] = (
 #: Scratch area the SSH user owns, used to stage privileged writes and to park
 #: backups of root-owned files. Inside the write allowlist on purpose.
 STAGE_DIR = "/opt/opspilot/test"
+
+#: ``systemd-analyze verify`` line for an ``ExecStart`` that does not resolve.
+_NOT_EXECUTABLE_RE = re.compile(r"Command (\S+) is not executable")
+
+
+def classify_verify_output(stderr: str) -> tuple[list[str], list[str]]:
+    """Split ``systemd-analyze verify`` output into (problems, deferred).
+
+    The check the design asks for is a *syntax* check (§8.2 语法检查), and
+    ``verify`` gives more than that: it also refuses a unit whose ``ExecStart``
+    does not resolve. A unit that names ``<app_root>/current/...`` is installed
+    *before* the link flips — that indirection is what makes an early install
+    safe — so at verify time that path is not supposed to exist yet. A missing
+    binary under a ``current/`` segment is the plan working as designed and
+    comes back as *deferred*; a missing binary anywhere else is a unit nobody
+    can start.
+
+    systemd's own warnings ("Failed to parse … ignoring", "Unknown section …
+    Ignoring") are dropped entirely: it has already said it is not acting on
+    them. Everything else is a *problem*.
+
+    An exit with nothing to classify is not a pass — see the caller.
+    """
+    problems: list[str] = []
+    deferred: list[str] = []
+    for line in stderr.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        match = _NOT_EXECUTABLE_RE.search(text)
+        if match and "/current/" in match.group(1):
+            deferred.append(text)
+            continue
+        if "ignoring" in text.lower():
+            continue
+        problems.append(text)
+    return problems, deferred
 
 _HTTP_SCHEMES = frozenset({"http", "https"})
 _HTTP_PORTS = frozenset({80, 443, 8000, 8080, 8443, 8888, 9000, 9090})
@@ -173,7 +214,7 @@ def _no_state_path(value: str) -> str:
 _RESERVED_RELEASE_IDS = frozenset({"latest", "current", "shared", "releases", "ops"})
 
 
-def _check_release_id(value: str) -> str:
+def check_release_id(value: str) -> str:
     if not _RELEASE_ID_RE.match(value):
         raise ValueError(f"invalid release_id {value!r}")
     if value.lower() in _RESERVED_RELEASE_IDS:
@@ -183,7 +224,7 @@ def _check_release_id(value: str) -> str:
     return value
 
 
-def _check_url(url: str, *, label: str = "url") -> str:
+def check_url(url: str, *, label: str = "url") -> str:
     """Scheme / host / port allowlist for anything that makes a request."""
     parsed = urlparse(url)
     if parsed.scheme not in _HTTP_SCHEMES:
@@ -246,7 +287,22 @@ class _Bases(Action[Any]):
         return ActionResult.from_exec(result, summary)
 
     def _exists(self, ctx: ExecContext, path: str) -> bool:
-        return self._exec(ctx, ["test", "-e", "--", path]).ok
+        """Does *path* exist on the host?
+
+        No ``--`` before the operand, deliberately. POSIX ``test`` is not a
+        regular GNU utility: it does **not** treat ``--`` as an end-of-options
+        marker. ``test -e -- /some/path`` has three operands, so ``test`` reads
+        ``--`` as a binary operator and exits 2 with "binary operator expected"
+        — which looks exactly like "the path is not there". That silently
+        disabled every existence probe: nothing was ever backed up, releases
+        were always re-unpacked, lock files always looked missing, and
+        ``app.switch_current`` refused to move ``current``.
+
+        The operand cannot be mistaken for an option: every path that reaches
+        here is validated absolute (see :func:`shared.actions.render.validate_read_path`)
+        and therefore begins with ``/``.
+        """
+        return self._exec(ctx, ["test", "-e", path]).ok
 
 
 # ==========================================================================
@@ -267,23 +323,31 @@ class SystemCheckOs(_Bases):
     def run(self, ctx: ExecContext, params: Mapping[str, Any]) -> ActionResult:
         p = self.build_params(params)
         result = self._exec(ctx, ["cat", "/etc/os-release"])
+        release = parse_os_release(result.stdout)
 
-        pretty = ""
-        for line in result.stdout.splitlines():
-            if line.startswith("PRETTY_NAME="):
-                pretty = line.split("=", 1)[1].strip().strip('"')
-                break
+        pretty = release.get("PRETTY_NAME", "")
+        os_id = release.get("ID", "").lower()
+        version = release.get("VERSION_ID", "")
+        # The vocabulary callers use is ``<id>-<version>`` — 'ubuntu-24.04',
+        # 'debian-12' — which is not a substring of /etc/os-release and cannot
+        # be matched against the raw file. Build the id and compare to that.
+        ident = f"{os_id}-{version}" if version else os_id
 
-        if p.expect and not any(token in result.stdout for token in p.expect):
+        if p.expect and not (set(p.expect) & {ident, os_id}):
             return ActionResult.failure(
-                f"OS {pretty or 'unknown'} is not one of {p.expect}",
+                f"OS {pretty or 'unknown'} ({ident or 'unknown'}) is not one of {p.expect}",
                 pretty_name=pretty,
+                platform=ident,
                 expect=list(p.expect),
             )
         return ActionResult(
             ok=True,
-            summary=f"OS is {pretty or 'unknown'}",
-            data={"pretty_name": pretty, "exit_code": result.exit_code},
+            summary=f"OS is {pretty or ident or 'unknown'}",
+            data={
+                "pretty_name": pretty,
+                "platform": ident,
+                "exit_code": result.exit_code,
+            },
             changed=False,
             argv=result.argv,
         )
@@ -304,7 +368,24 @@ class CheckDiskParams(ParamsModel):
 class SystemCheckDisk(_Bases):
     def run(self, ctx: ExecContext, params: Mapping[str, Any]) -> ActionResult:
         p = self.build_params(params)
-        result = self._exec(ctx, ["df", "-Pm", "--", p.path])
+        # ``df`` cannot stat a path that does not exist yet, and a free-space
+        # precheck on a release directory is run *before* the plan creates it.
+        # Walk up to the nearest existing ancestor: the space that matters is
+        # the filesystem the directory will be created on.
+        target = p.path
+        result = self._exec(ctx, ["df", "-Pm", "--", target])
+        for _ in range(16):
+            if result.ok:
+                break
+            stripped = target.rstrip("/")
+            if "/" not in stripped:
+                break
+            parent = stripped.rsplit("/", 1)[0] or "/"
+            if parent == target:
+                break
+            target = parent
+            result = self._exec(ctx, ["df", "-Pm", "--", target])
+
         if not result.ok:
             return ActionResult.failure(f"could not read free space for {p.path}")
 
@@ -318,14 +399,15 @@ class SystemCheckDisk(_Bases):
 
         if available_mb < p.min_available_mb:
             return ActionResult.failure(
-                f"{p.path} has {available_mb} MB free, need {p.min_available_mb} MB",
+                f"{target} has {available_mb} MB free, need {p.min_available_mb} MB",
                 available_mb=available_mb,
                 required_mb=p.min_available_mb,
             )
+        measured = f"{p.path} (via {target})" if target != p.path else p.path
         return ActionResult(
             ok=True,
-            summary=f"{p.path} has {available_mb} MB free",
-            data={"path": p.path, "available_mb": available_mb},
+            summary=f"{measured} has {available_mb} MB free",
+            data={"path": p.path, "measured_path": target, "available_mb": available_mb},
             changed=False,
             argv=result.argv,
         )
@@ -498,6 +580,16 @@ class FileRender(_Bases):
             backed_up = True
 
         tmp = f"{p.path}.opspilot-new"
+        # ``dd of=`` cannot create the directory it writes into either, and the
+        # deploy's env file lives at ``shared/config/app.env`` — a tree that a
+        # first deploy has not built. Create the parent before writing.
+        parent = posixpath.dirname(p.path)
+        made = self._exec(ctx, ["mkdir", "-p", "--", parent])
+        if not made.ok:
+            return ActionResult.failure(
+                f"could not create {parent}", stderr=made.stderr[:500]
+            )
+
         # `dd of=` consumes stdin and writes nothing back. `tee` would echo the
         # contents into stdout, and stdout is part of what we persist.
         write = self._exec(ctx, ["dd", f"of={tmp}", "status=none"], stdin=p.content)
@@ -541,8 +633,8 @@ class FetchReleaseParams(ParamsModel):
 
     @model_validator(mode="after")
     def _check(self) -> FetchReleaseParams:
-        _check_release_id(self.release_id)
-        _check_url(self.source, label="source")
+        check_release_id(self.release_id)
+        check_url(self.source, label="source")
         _no_state_path(f"{self.app_root}/releases/{self.release_id}")
         return self
 
@@ -558,6 +650,18 @@ class AppFetchRelease(_Bases):
         p = self.build_params(params)
         target = f"{p.app_root}/releases/{p.release_id}"
         artifact = f"{target}.artifact"
+
+        # ``curl -o`` cannot create the directory it writes into. On a first
+        # deploy nothing has created ``releases/`` yet — ``system.check_disk``
+        # only *measures* its parent — and curl fails with exit 23 ("Failure
+        # writing output to destination") for want of a mkdir nobody ran.
+        # Unconditional rather than exists-checked: ``mkdir -p`` is idempotent,
+        # and probing first would burn a ``test`` response for nothing.
+        made = self._exec(ctx, ["mkdir", "-p", "--", f"{p.app_root}/releases"])
+        if not made.ok:
+            return ActionResult.failure(
+                f"could not create {p.app_root}/releases", stderr=made.stderr[:500]
+            )
 
         fetch = self._exec(
             ctx,
@@ -610,11 +714,24 @@ class InstallReleaseParams(ParamsModel):
     app_root: RemotePath
     release_id: NonEmpty
     owner: OptionalUserName = ""
+    #: Build the release's own virtualenv from this interpreter version. Empty
+    #: means "no venv" — the release ships one of its own, or is not Python.
+    python_version: OptionalVersion = ""
+    #: Lock file *inside* the release, relative to its root. Relative on
+    #: purpose: an absolute path here would be a way to pip-install from
+    #: anywhere on the host.
+    requirements: str = "requirements.lock"
 
     @model_validator(mode="after")
     def _check(self) -> InstallReleaseParams:
-        _check_release_id(self.release_id)
+        check_release_id(self.release_id)
         _no_state_path(f"{self.app_root}/releases/{self.release_id}")
+        if self.requirements and (
+            self.requirements.startswith("/") or ".." in self.requirements.split("/")
+        ):
+            raise ValueError(
+                f"requirements must be a path inside the release, got {self.requirements!r}"
+            )
         return self
 
 
@@ -625,33 +742,200 @@ class InstallReleaseParams(ParamsModel):
     description="Unpack a release into releases/<id>; never touches shared/.",
 )
 class AppInstallRelease(_Bases):
+    """Unpack a release and, optionally, give it its own virtualenv.
+
+    The venv lives inside ``releases/<id>/`` rather than beside ``shared/``,
+    so two releases can be ready at the same time and a rollback does not have
+    to rebuild dependencies. Re-running finds the venv already there and leaves
+    it alone.
+    """
+
     def run(self, ctx: ExecContext, params: Mapping[str, Any]) -> ActionResult:
         p = self.build_params(params)
         target = f"{p.app_root}/releases/{p.release_id}"
         artifact = f"{target}.artifact"
 
-        if self._exists(ctx, target):
-            return ActionResult.skipped(f"release {p.release_id} is already installed")
+        already = self._exists(ctx, target)
+        if not already:
+            made = self._exec(ctx, ["mkdir", "-p", "--", target])
+            if not made.ok:
+                return ActionResult.failure(
+                    f"could not create {target}", stderr=made.stderr[:500]
+                )
 
-        made = self._exec(ctx, ["mkdir", "-p", "--", target])
-        if not made.ok:
-            return ActionResult.failure(
-                f"could not create {target}", stderr=made.stderr[:500]
+            unpack = self._exec(
+                ctx, ["tar", "-xzf", artifact, "-C", target, "--strip-components=1"]
+            )
+            if not unpack.ok:
+                # Leave nothing half-unpacked behind: a partial release directory
+                # is worse than a missing one, because the symlink switch would
+                # happily point at it.
+                self._exec(ctx, ["rm", "-rf", "--", target])
+                return ActionResult.failure("unpack failed", stderr=unpack.stderr[:500])
+
+            if p.owner:
+                self._exec(ctx, ["chown", "-R", p.owner, "--", target])
+
+        built = self._ensure_venv(ctx, p, target)
+        if built is not None:
+            return built
+
+        if already:
+            return ActionResult.skipped(
+                f"release {p.release_id} is already installed",
+                venv=bool(p.python_version),
+            )
+        return ActionResult(
+            ok=True,
+            summary=f"installed release {p.release_id}",
+            data={
+                "release_id": p.release_id,
+                "path": target,
+                "venv": bool(p.python_version),
+                "requirements": p.requirements if p.python_version else None,
+            },
+            changed=True,
+            argv=(),
+        )
+
+    def _ensure_venv(
+        self, ctx: ExecContext, p: InstallReleaseParams, target: str
+    ) -> ActionResult | None:
+        """Create the release venv and install the locked deps.
+
+        Returns ``None`` when the install should report its own outcome, or a
+        terminal result when the venv work failed or there is nothing left to
+        say about it.
+        """
+        if not p.python_version:
+            return None
+
+        venv = f"{target}/venv"
+        if self._exists(ctx, venv):
+            return ActionResult.skipped(
+                f"venv for {p.release_id} is already built", venv=True
             )
 
-        unpack = self._exec(
-            ctx, ["tar", "-xzf", artifact, "-C", target, "--strip-components=1"]
-        )
-        if not unpack.ok:
-            # Leave nothing half-unpacked behind: a partial release directory is
-            # worse than a missing one, because the symlink switch would happily
-            # point at it.
-            self._exec(ctx, ["rm", "-rf", "--", target])
-            return ActionResult.failure("unpack failed", stderr=unpack.stderr[:500])
+        made = self._exec(ctx, [f"python{p.python_version}", "-m", "venv", "--", venv])
+        if not made.ok:
+            return ActionResult.failure(
+                f"could not create the venv for {p.release_id}", stderr=made.stderr[:500]
+            )
 
         if p.owner:
-            self._exec(ctx, ["chown", "-R", p.owner, "--", target])
-        return self._from_exec(unpack, f"installed release {p.release_id}")
+            self._exec(ctx, ["chown", "-R", p.owner, "--", venv])
+
+        if not p.requirements:
+            return None
+        lock = f"{target}/{p.requirements}"
+        if not self._exists(ctx, lock):
+            # A release with no lock file is not an error: it may ship a venv of
+            # its own, or need nothing installed. Worth saying so, though.
+            return None
+
+        # --no-deps is the point of a lock file: it already lists every
+        # transitive requirement, so letting pip resolve anything would mean
+        # the deployed set is not the reviewed set.
+        install = self._exec(
+            ctx,
+            [
+                f"{venv}/bin/pip",
+                "install",
+                "--no-deps",
+                "--disable-pip-version-check",
+                "-r",
+                lock,
+            ],
+        )
+        if not install.ok:
+            return ActionResult.failure(
+                f"could not install locked dependencies for {p.release_id}",
+                stderr=install.stderr[:500],
+            )
+        return None
+
+
+class SwitchCurrentParams(ParamsModel):
+    app_root: RemotePath
+    release_id: NonEmpty
+
+    @model_validator(mode="after")
+    def _check(self) -> SwitchCurrentParams:
+        check_release_id(self.release_id)
+        _no_state_path(f"{self.app_root}/releases/{self.release_id}")
+        return self
+
+
+@register(
+    "app.switch_current",
+    params=SwitchCurrentParams,
+    idempotency_class="CONDITIONAL",
+    description="Atomically point current at releases/<id>; never touches shared/.",
+)
+class AppSwitchCurrent(_Bases):
+    """Make one release live.
+
+    The switch has to be a single rename, not "unlink then symlink": between
+    those two a process that restarts finds no ``current`` at all and dies. So
+    the new link is built under a temporary name and ``mv -T`` renames it over
+    the old one in one syscall. ``-T`` is load-bearing — without it ``mv``
+    would move the link *into* the directory the old link points at.
+
+    Re-pointing at the release ``current`` already names is a no-op, which is
+    what makes a retried deploy and a rollback-to-current safe to run twice.
+    """
+
+    def run(self, ctx: ExecContext, params: Mapping[str, Any]) -> ActionResult:
+        p = self.build_params(params)
+        target = f"{p.app_root}/releases/{p.release_id}"
+        link = f"{p.app_root}/current"
+        wanted = f"releases/{p.release_id}"
+
+        if not self._exists(ctx, target):
+            return ActionResult.failure(
+                f"release {p.release_id} is not installed; refusing to move current onto it"
+            )
+
+        read = self._exec(ctx, ["readlink", "--", link])
+        was = read.stdout.strip()
+        if was in {wanted, target}:
+            return ActionResult.skipped(
+                f"current already points at {p.release_id}", previous=was or None
+            )
+
+        scratch = f"{p.app_root}/.current.opspilot-new"
+        self._exec(ctx, ["rm", "-f", "--", scratch])
+        made = self._exec(ctx, ["ln", "-s", "--", wanted, scratch])
+        if not made.ok:
+            return ActionResult.failure(
+                "could not stage the new current link", stderr=made.stderr[:500]
+            )
+
+        swap = self._exec(ctx, ["mv", "-Tf", "--", scratch, link])
+        if not swap.ok:
+            self._exec(ctx, ["rm", "-f", "--", scratch])
+            return ActionResult.failure(
+                "could not switch current", stderr=swap.stderr[:500]
+            )
+
+        after = self._exec(ctx, ["readlink", "--", link]).stdout.strip()
+        if after not in {wanted, target}:
+            return ActionResult.failure(
+                f"current is {after!r} after the switch, expected {wanted!r}"
+            )
+
+        return ActionResult(
+            ok=True,
+            summary=f"current -> {p.release_id}",
+            data={
+                "app_root": p.app_root,
+                "release_id": p.release_id,
+                "previous": was or None,
+                "current": after,
+            },
+            changed=True,
+            argv=swap.argv,
+        )
 
 
 # ==========================================================================
@@ -702,7 +986,16 @@ class SystemdRenderUnit(_Bases):
             backed_up = True
 
         # Stage the content where the SSH user can write, then install it.
-        self._exec(ctx, ["mkdir", "-p", "--", STAGE_DIR])
+        # The mkdir is checked: a stage dir the SSH user cannot create produces
+        # a confusing dd error otherwise, which sends an operator looking at
+        # the wrong thing. The stage dir is a fixed scratch area, not a caller
+        # input, so there is no path to validate here.
+        made = self._exec(ctx, ["mkdir", "-p", "--", STAGE_DIR])
+        if not made.ok:
+            return ActionResult.failure(
+                f"could not create the staging area {STAGE_DIR}",
+                stderr=made.stderr[:500],
+            )
         staged = f"{STAGE_DIR}/.unit-{p.unit_path.rsplit('/', 1)[-1]}.new"
         write = self._exec(ctx, ["dd", f"of={staged}", "status=none"], stdin=p.content)
         if not write.ok:
@@ -718,11 +1011,20 @@ class SystemdRenderUnit(_Bases):
             )
 
         # Syntax check after the write. A unit systemd refuses to parse must not
-        # be left in place — put the backup back.
+        # be left in place — put the backup back. See `classify_verify_output`
+        # for why a not-yet-flipped `current` path is not a parse failure.
         verify = self._exec(
             ctx, ["/usr/bin/systemd-analyze", "verify", "--", p.unit_path]
         )
-        if not verify.ok:
+        problems, deferred = classify_verify_output(verify.stderr)
+        if not verify.ok and not problems and not deferred:
+            # Exited badly with nothing to classify — do not guess that it is
+            # fine. An empty stderr is not the same as an explained exit.
+            problems = [
+                verify.stderr.strip()
+                or f"systemd-analyze verify exited {verify.exit_code}"
+            ]
+        if problems:
             restored = False
             if backed_up:
                 restored = self._sudo(
@@ -731,7 +1033,7 @@ class SystemdRenderUnit(_Bases):
             return ActionResult.failure(
                 f"unit {p.unit_path} failed systemd-analyze verify"
                 + ("; previous unit restored" if restored else ""),
-                stderr=verify.stderr[:500],
+                stderr="\n".join(problems)[:500],
             )
 
         reload = self._sudo(ctx, "/usr/bin/systemctl", "daemon-reload")
@@ -744,6 +1046,8 @@ class SystemdRenderUnit(_Bases):
                 "backup": backed_up,
                 "sha256": _sha256_hex(p.content),
                 "daemon_reloaded": reload.ok,
+                "syntax_checked": True,
+                "exec_start_pending": bool(deferred),
             },
             changed=True,
             argv=install.argv,
@@ -806,7 +1110,7 @@ class HttpCheckParams(ParamsModel):
 
     @model_validator(mode="after")
     def _check(self) -> HttpCheckParams:
-        _check_url(self.url)
+        check_url(self.url)
         return self
 
 
@@ -959,7 +1263,7 @@ class RedisPrecheck(_Bases):
                     "config_overwritten": False,
                 },
                 changed=False,
-                argv=("test", "-e", "--", p.config_path),
+                argv=("test", "-e", p.config_path),
             )
 
         result = self._exec(

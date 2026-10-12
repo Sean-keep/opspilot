@@ -144,7 +144,7 @@ class FileRender(Action):
   决定租约过期后能否自动重跑（见 [state-machines.md](state-machines.md)）
 - `requires_sudo`：是否需要受限 sudo 白名单
 
-### V1 的 15 个动作
+### V1 的 16 个动作
 
 | 动作 | 用途 | 幂等 |
 |---|---|---|
@@ -156,6 +156,7 @@ class FileRender(Action):
 | `file.render` | 原子写文件 / 建目录 | CONDITIONAL |
 | `app.fetch_release` | 拉取制品并校验和 | CONDITIONAL |
 | `app.install_release` | 解压到 `releases/<id>` | CONDITIONAL |
+| `app.switch_current` | 原子切换 `current` 软链接 | CONDITIONAL |
 | `systemd.render_unit` | 生成 unit 文件 | CONDITIONAL |
 | `systemd.restart` | 重启服务 | DESTRUCTIVE |
 | `supervisor.restart` | 重启 supervisor 程序 | DESTRUCTIVE |
@@ -163,6 +164,10 @@ class FileRender(Action):
 | `mysql.precheck` | 只读：MySQL 预检 | SAFE |
 | `redis.precheck` | 只读：Redis 预检 | SAFE |
 | `notification.telegram` | 发通知 | SAFE |
+
+`app.switch_current` 是设计文档 §7.4 那 15 个之外的第 16 个：发布链路必须原子翻转
+`current`，没有它就只能 `rm` 再 `ln`，而那个窗口是不可接受的。它的 argv 形状、幂等跳过
+和恢复策略见 [deployment.md](deployment.md)。
 
 未注册的 action 一律拒绝。**V1 不允许 AI 或用户直接提交任意 Shell 命令并以 root 执行。**
 

@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import Depends
 
+from backend.app.api.routing import AppRouter
 from backend.app.audit.service import RESULT_SUCCESS, write_audit
 from backend.app.auth.deps import DbSession, require_permission
 from backend.app.auth.models import User
@@ -18,7 +19,7 @@ from backend.app.credentials.models import Credential
 from backend.app.credentials.schemas import CredentialCreate, CredentialOut, CredentialRotate
 from backend.app.credentials.service import CredentialService
 
-router = APIRouter(prefix="/credentials", tags=["credentials"])
+router = AppRouter(prefix="/credentials", tags=["credentials"])
 
 CanReadCredentials = Annotated[User, Depends(require_permission("credential.read"))]
 CanCreateCredential = Annotated[User, Depends(require_permission("credential.create"))]

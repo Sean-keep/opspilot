@@ -431,3 +431,47 @@ class TestSchedulerTick:
 
         scheduler = Scheduler(worker_id="idle-worker", settings=settings)
         assert scheduler.tick() is False
+
+
+class TestLeaseRenewal:
+    """``tick`` renews after ``execute`` as a safety net.
+
+    That net must not cry wolf. Finishing a run releases its lease on purpose,
+    so a shortfall afterwards is the *normal* end of a successful run — and a
+    ``worker.lease_lost`` warning on every success would teach operators to
+    ignore the one that matters.
+    """
+
+    def test_a_finished_run_is_not_a_lost_lease(
+        self, db: Session, settings: Settings
+    ) -> None:
+        from shared.task_protocol import release_run
+        from structlog.testing import capture_logs
+
+        server_id, _ = _seed_server(db)
+        _task, run = _seed_task(db, server_id)
+        _claim(db, owner="tick-worker")
+        assert release_run(
+            db, run_id=int(run.id), owner="tick-worker", status="SUCCESS"
+        )
+
+        scheduler = Scheduler(worker_id="tick-worker", settings=settings)
+        with capture_logs() as cap:
+            scheduler._renew(db, [int(run.id)])
+
+        assert "worker.lease_lost" not in [e.get("event") for e in cap]
+
+    def test_a_stolen_lease_is_still_reported(self, db: Session, settings: Settings) -> None:
+        from structlog.testing import capture_logs
+
+        server_id, _ = _seed_server(db)
+        _task, run = _seed_task(db, server_id)
+        _claim(db, owner="someone-else")
+
+        scheduler = Scheduler(worker_id="victim", settings=settings)
+        with capture_logs() as cap:
+            scheduler._renew(db, [int(run.id)])
+
+        lost = [e for e in cap if e.get("event") == "worker.lease_lost"]
+        assert len(lost) == 1
+        assert lost[0]["still_active"] == 1

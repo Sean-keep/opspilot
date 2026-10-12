@@ -23,14 +23,22 @@ from backend.app.db.session import get_session_factory
 _bearer = HTTPBearer(auto_error=False)
 
 
-def get_db() -> Generator[Session, None, None]:
+def get_db(request: Request) -> Generator[Session, None, None]:
     """Request-scoped database session.
 
-    Commits at the end of a successful request and rolls back on error. Kept
-    deliberately simple — the API is short-lived per request.
+    Rolls back on error and closes at the end of the request. **Committing is
+    not done here**: FastAPI unwinds this generator after the response has been
+    sent, so a commit at this point would let a ``201`` reach the client before
+    the row is durable. ``CommitRoute`` commits after the handler returns and
+    before the response leaves — see ``backend/app/api/routing.py``. The
+    session is attached to ``request.state.db`` for that purpose.
+
+    The teardown commit below is a safety net only. It runs late, and nothing
+    depends on it.
     """
     factory = get_session_factory()
     session = factory()
+    request.state.db = session
     try:
         yield session
         session.commit()
@@ -38,6 +46,7 @@ def get_db() -> Generator[Session, None, None]:
         session.rollback()
         raise
     finally:
+        request.state.db = None
         session.close()
 
 

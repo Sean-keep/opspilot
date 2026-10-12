@@ -22,6 +22,7 @@ from shared.task_protocol.models import (
     TaskStep,
 )
 
+from backend.app.applications.models import AppEnvironment, Application
 from backend.app.audit.models import AuditLog
 from backend.app.auth.models import (
     Permission,
@@ -33,6 +34,7 @@ from backend.app.auth.models import (
 from backend.app.catalog.models import Template, TemplateVersion
 from backend.app.credentials.models import Credential
 from backend.app.db.base import Base
+from backend.app.deployments.models import Deployment
 from backend.app.inventory.models import (
     Server,
     ServerFacts,
@@ -42,9 +44,12 @@ from backend.app.inventory.models import (
 
 __all__ = [
     "ApiIdempotency",
+    "AppEnvironment",
+    "Application",
     "AuditLog",
     "Base",
     "Credential",
+    "Deployment",
     "LeaseRecovery",
     "OutboxEvent",
     "Permission",

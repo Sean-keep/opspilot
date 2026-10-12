@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import datetime as dt
 
-from fastapi import APIRouter, Response
+from fastapi import Response
 
+from backend.app.api.routing import AppRouter
 from backend.app.core.settings import get_settings
 from backend.app.db.session import ping
 
-router = APIRouter(tags=["health"])
+router = AppRouter(tags=["health"])
 
 
 @router.get("/healthz")

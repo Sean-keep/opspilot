@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import Depends, Query, Response, status
 
+from backend.app.api.routing import AppRouter
 from backend.app.auth.deps import DbSession, require_permission
 from backend.app.auth.models import User
 from backend.app.inventory.schemas import (
@@ -25,7 +26,7 @@ from backend.app.inventory.service import InventoryService
 from backend.app.orchestrator.schemas import TaskOut
 from backend.app.orchestrator.service import TaskService
 
-router = APIRouter(prefix="/servers", tags=["inventory"])
+router = AppRouter(prefix="/servers", tags=["inventory"])
 
 CanReadServers = Annotated[User, Depends(require_permission("server.read"))]
 CanCreateServer = Annotated[User, Depends(require_permission("server.create"))]

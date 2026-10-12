@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 
 from shared.dbtypes import utcnow
 from shared.redaction import redact
-from shared.task_protocol.models import LeaseRecovery, Task, TaskRun
+from shared.task_protocol.models import LeaseRecovery, Task, TaskRun, TaskStep
 from shared.task_protocol.states import (
     IDEMPOTENCY_CONDITIONAL,
     IDEMPOTENCY_DESTRUCTIVE,
@@ -35,10 +35,14 @@ from shared.task_protocol.states import (
     RUN_SUCCESS,
     RUN_UNKNOWN,
     RUN_WAITING,
+    STEP_SUCCESS,
+    STEP_TERMINAL,
+    STEP_UNKNOWN,
 )
 from shared.task_protocol.transitions import (
     aggregate_task_status,
     ensure_run_transition,
+    ensure_step_transition,
     is_task_terminal,
     task_route,
 )
@@ -358,6 +362,34 @@ def apply_recovery(
         run.finished_at = utcnow()
         run.lease_owner = ""
         run.lease_expires_at = None
+
+    # A step may only say ``RUNNING`` while something is actually executing it.
+    # ``renew`` is the one decision where that is still true — the probe found
+    # the remote work alive, so leave its step alone. Every other decision ends
+    # the work here, and a step left claiming to run is a lie: a query counting
+    # in-flight steps would believe something is happening that is not. (Seen
+    # for real: a deploy killed mid-``ensure_user`` recovered the run to
+    # ``UNKNOWN`` while the step still read ``RUNNING``.)
+    #
+    # The status each open step takes is the best verdict available, never a
+    # new one — ``STEP_RUNNING -> STEP_UNKNOWN`` and ``-> STEP_SUCCESS`` are
+    # both legal moves in ``STEP_TRANSITIONS``:
+    #   requeue / unknown -> UNKNOWN   "we never saw the end of this"
+    #   skip              -> SUCCESS   the run-level evidence said it worked
+    #
+    # On ``requeue`` this also keeps the abandoned attempt honest: its step
+    # rows stay at their own ``attempt`` number, just no longer mid-flight.
+    if decision != DECISION_RENEW:
+        closing = STEP_SUCCESS if decision == DECISION_SKIP else STEP_UNKNOWN
+        for step in session.execute(
+            select(TaskStep).where(
+                TaskStep.run_id == run.id,
+                TaskStep.status.notin_(sorted(STEP_TERMINAL)),
+            )
+        ).scalars():
+            ensure_step_transition(step.status, closing)
+            step.status = closing
+            step.finished_at = utcnow()
 
     run.recovery_note = note[:8000]
     session.add(

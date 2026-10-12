@@ -28,6 +28,7 @@ from shared.actions.render import (
 __all__ = [
     "NonEmpty",
     "OptionalUserName",
+    "OptionalVersion",
     "Packages",
     "ReadPath",
     "RemotePath",
@@ -56,6 +57,13 @@ def _version(value: str) -> str:
     if not VERSION_RE.match(value):
         raise ValueError(f"invalid version {value!r}")
     return value
+
+
+def _version_or_empty(value: str) -> str:
+    """An optional version field: a real one, or ``""`` for "unset"."""
+    if value == "":
+        return value
+    return _version(value)
 
 
 def _service_name(value: str) -> str:
@@ -89,6 +97,9 @@ UserName = Annotated[str, AfterValidator(_username)]
 #: as optional even though every action treats an empty owner as "leave it alone".
 OptionalUserName = Annotated[str, AfterValidator(_username_or_empty)]
 Version = Annotated[str, AfterValidator(_version)]
+#: For optional fields such as ``python_version``: a real version, or ``""``
+#: meaning "this release does not need one".
+OptionalVersion = Annotated[str, AfterValidator(_version_or_empty)]
 ServiceName = Annotated[str, AfterValidator(_service_name)]
 Packages = Annotated[list[str], AfterValidator(_packages), Field(min_length=1)]
 #: A path that is absolute and inside an allowed **write** prefix.

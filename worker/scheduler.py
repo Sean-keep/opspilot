@@ -25,6 +25,7 @@ from shared.task_protocol import (
     IDEMPOTENCY_SAFE,
     PROBE_FINISHED,
     PROBE_UNREACHABLE,
+    RUN_ACTIVE,
     RUN_WAITING,
     TaskRun,
     TaskStep,
@@ -35,7 +36,7 @@ from shared.task_protocol import (
     renew_leases,
 )
 from shared.task_protocol.claim import apply_recovery
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from worker.db import get_factory
 from worker.runner import Runner
@@ -117,11 +118,28 @@ class Scheduler:
             run_ids=run_ids,
             lease_seconds=self.settings.lease_seconds,
         )
-        if renewed < len(run_ids):
+        if renewed >= len(run_ids):
+            return
+        # A shortfall is only a *lost* lease while the work is still ours to
+        # hold. Finishing a run releases its lease on purpose, so counting that
+        # as a loss would put a warning on every successful run and teach
+        # operators to ignore this event.
+        still_ours = int(
+            session.execute(
+                select(func.count())
+                .select_from(TaskRun)
+                .where(
+                    TaskRun.id.in_(list(run_ids)),
+                    TaskRun.status.in_(sorted(RUN_ACTIVE)),
+                )
+            ).scalar_one()
+        )
+        if still_ours:
             log.warning(
                 "worker.lease_lost",
                 wanted=len(run_ids),
                 renewed=renewed,
+                still_active=still_ours,
                 worker_id=self.worker_id,
             )
 

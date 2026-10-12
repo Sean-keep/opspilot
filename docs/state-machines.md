@@ -150,6 +150,21 @@ UNKNOWN ──► SUCCESS / FAILED / CANCELLED
 
 步骤记录 `result_json`、`started_at`、`finished_at`、`exit_code`、`duration_ms`。
 
+### 恢复必须收尾步骤行
+
+步骤说 `RUNNING`，意思就是**有东西正在执行它**。租约恢复里只有 `renew` 仍成立（探针发现远端
+还活着），所以只有 `renew` 允许留下 `RUNNING` 的步骤行。其余判定一律把未终结的步骤收尾：
+
+| 判定 | Run | 未终结的步骤 |
+|---|---|---|
+| `renewed` | 留在 `EXECUTING` | 留在 `RUNNING`（远端还在跑） |
+| `skipped` | → `SUCCESS` | → `SUCCESS`（run 级证据说它成了） |
+| `requeued` | → `WAITING` | → `UNKNOWN`（这一 attempt 被放弃） |
+| `marked_unknown` | → `UNKNOWN` | → `UNKNOWN`（没看到它的下文） |
+
+不收尾的后果在真机演练里见过：部署在 `ensure_user` 中途被 `SIGKILL`，Run 恢复成 `UNKNOWN`
+了，步骤还写着 `RUNNING` —— 什么都没在跑。任何数「在跑步骤」的查询都会被它骗。
+
 ## 取消 ≠ 回滚
 
 `POST /tasks/{id}/cancel` → 任务 `RUNNING → CANCELLING`。Worker 在步骤边界检查取消标记，对

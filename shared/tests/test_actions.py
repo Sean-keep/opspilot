@@ -9,7 +9,9 @@ the audit trail, a Telegram token landing in argv.
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -25,7 +27,9 @@ from shared.actions.base import (
 )
 from shared.actions.builtin import (
     ALLOWED_SUDO_RULES,
+    AppSwitchCurrent,
     check_service_allowed,
+    classify_verify_output,
     ensure_sudo_allowed,
 )
 from shared.actions.render import (
@@ -42,6 +46,7 @@ from shared.redaction import REDACTED, redact_text
 EXPECTED_ACTIONS = {
     "app.fetch_release",
     "app.install_release",
+    "app.switch_current",
     "file.render",
     "http.check",
     "mysql.precheck",
@@ -68,6 +73,7 @@ EXPECTED_IDEMPOTENCY = {
     "file.render": "CONDITIONAL",
     "app.fetch_release": "CONDITIONAL",
     "app.install_release": "CONDITIONAL",
+    "app.switch_current": "CONDITIONAL",
     "systemd.render_unit": "CONDITIONAL",
     "systemd.restart": "DESTRUCTIVE",
     "supervisor.restart": "DESTRUCTIVE",
@@ -141,7 +147,16 @@ def _ok(stdout: str = "", exit_code: int = 0) -> ExecResult:
 # ==========================================================================
 # Registry shape
 # ==========================================================================
-def test_register_all_loads_exactly_the_fifteen_v1_actions() -> None:
+def test_register_all_loads_the_whitelisted_actions() -> None:
+    """The registry is exactly the set we intend — no more, no fewer.
+
+    Sixteen, not the fifteen in the design document's §7.4 table:
+    ``app.switch_current`` is the §8.2 "原子切换 current 软链接" step, which is
+    a remote operation and therefore has to go through the same whitelist as
+    everything else. Leaving it out would have meant the worker reaching for
+    ``ln``/``mv`` outside the registry, which is the one thing the registry
+    exists to prevent.
+    """
     register_all()
     assert set(get_registry()) == EXPECTED_ACTIONS
 
@@ -311,6 +326,69 @@ def test_a_hostile_check_disk_path_stays_one_argv_token(payload: str) -> None:
     assert "touch" not in tokens[:-1]
 
 
+class _PathAwareDfPort(RecordingPort):
+    """Answers ``df`` only for paths that "exist"; fails the others."""
+
+    def __init__(self, existing: set[str]) -> None:
+        super().__init__()
+        self.existing = existing
+
+    def run(self, ctx, argv, *, stdin=None):
+        tokens = tuple(argv)
+        self.calls.append((tokens, stdin))
+        if tokens[0] != "df":
+            return self.default
+        if tokens[-1] not in self.existing:
+            return ExecResult(
+                exit_code=1, stdout="", stderr=f"df: {tokens[-1]}: No such file", argv=tokens
+            )
+        return ExecResult(
+            exit_code=0,
+            stdout=(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                "/dev/sda1 10 1 9 10% /\n"
+            ),
+            stderr="",
+            argv=tokens,
+        )
+
+
+def test_check_disk_walks_up_when_the_path_does_not_exist_yet() -> None:
+    """A free-space precheck runs *before* the plan creates the directory.
+
+    ``df`` cannot stat a path that is not there, so the first deploy of an app
+    would fail its own precheck. The measurement must fall back to the nearest
+    existing ancestor — the filesystem the directory will be created on.
+    """
+    port = _PathAwareDfPort({"/opt/opspilot/apps"})
+    action = resolve("system.check_disk", port)
+    result = action.run(
+        CTX,
+        {"path": "/opt/opspilot/apps/billing-api/releases", "min_available_mb": 1},
+    )
+
+    assert result.ok, result.summary
+    assert [c[-1] for c in port.argvs()] == [
+        "/opt/opspilot/apps/billing-api/releases",
+        "/opt/opspilot/apps/billing-api",
+        "/opt/opspilot/apps",
+    ]
+    assert result.data["measured_path"] == "/opt/opspilot/apps"
+    assert "billing-api/releases" in result.summary
+    assert "via /opt/opspilot/apps" in result.summary
+
+
+def test_check_disk_does_not_invent_a_path_that_never_appears() -> None:
+    """If no ancestor answers, the failure names the path that was asked for."""
+    port = _PathAwareDfPort(set())
+    action = resolve("system.check_disk", port)
+    result = action.run(
+        CTX, {"path": "/opt/opspilot/apps/nope/releases", "min_available_mb": 1}
+    )
+    assert not result.ok
+    assert "/opt/opspilot/apps/nope/releases" in result.summary
+
+
 @pytest.mark.parametrize("payload", INJECTION_PAYLOADS)
 def test_a_hostile_package_name_is_rejected_before_anything_runs(payload: str) -> None:
     port = RecordingPort()
@@ -430,6 +508,38 @@ def test_file_render_may_write_config_into_shared_config() -> None:
     assert moved
 
 
+def test_file_render_creates_the_parent_directory_before_writing() -> None:
+    """``dd of=`` cannot create the directory it writes into.
+
+    The deploy's env file is ``shared/config/app.env`` — a tree a first deploy
+    has not built — so writing without a mkdir first fails on exactly the run
+    that matters.
+    """
+    port = RecordingPort(
+        {
+            "test": ExecResult(exit_code=1, stdout="", stderr="", argv=()),
+            "mkdir": _ok(),
+            "dd": _ok(),
+            "mv": _ok(),
+            "chmod": _ok(),
+        }
+    )
+    action = resolve("file.render", port)
+    result = action.run(
+        CTX,
+        {
+            "path": "/opt/opspilot/apps/demo/shared/config/app.env",
+            "content": "A=1",
+            "backup": False,
+        },
+    )
+    assert result.ok
+    joined = port.joined()
+    made = joined.index("mkdir -p -- /opt/opspilot/apps/demo/shared/config")
+    wrote = next(i for i, t in enumerate(joined) if t.startswith("dd "))
+    assert made < wrote, "the parent directory must exist before dd opens the file"
+
+
 # ==========================================================================
 # app.* — releases and shared/
 # ==========================================================================
@@ -475,6 +585,121 @@ def test_install_release_cleans_up_a_half_unpacked_directory() -> None:
     assert cleaned == ["rm -rf -- /opt/opspilot/apps/demo/releases/2026-10-12"]
 
 
+def test_install_release_builds_a_per_release_venv_and_installs_the_lock() -> None:
+    """§8.2 step 4: a dedicated virtualenv, deps from the lock file.
+
+    The venv lives inside ``releases/<id>`` so a rollback to the previous
+    release does not have to rebuild anything — both trees stay ready.
+    """
+    venv_pip = "/opt/opspilot/apps/demo/releases/1.0.0/venv/bin/pip"
+    port = ScriptedPort(
+        {
+            "test": [
+                ExecResult(exit_code=1, stdout="", stderr="", argv=()),  # no release dir
+                ExecResult(exit_code=1, stdout="", stderr="", argv=()),  # no venv yet
+                _ok(),  # lock file is there
+            ],
+            "mkdir": [_ok()],
+            "tar": [_ok()],
+            "python3.12": [_ok()],
+            venv_pip: [_ok()],
+        }
+    )
+    action = resolve("app.install_release", port)
+    result = action.run(
+        CTX,
+        {
+            "app_root": "/opt/opspilot/apps/demo",
+            "release_id": "1.0.0",
+            "python_version": "3.12",
+        },
+    )
+    assert result.ok and result.data["venv"] is True
+    joined = port.joined()
+    assert "python3.12 -m venv -- /opt/opspilot/apps/demo/releases/1.0.0/venv" in joined
+    install = [t for t in joined if t.startswith(venv_pip)]
+    assert install == [
+        f"{venv_pip} install --no-deps --disable-pip-version-check "
+        "-r /opt/opspilot/apps/demo/releases/1.0.0/requirements.lock"
+    ]
+    # --no-deps is the whole point of a lock file: pip must not resolve.
+    assert "--no-deps" in install[0]
+
+
+def test_install_release_reuses_a_venv_it_already_built() -> None:
+    port = ScriptedPort(
+        {
+            "test": [
+                _ok(),  # release dir exists
+                _ok(),  # venv exists
+            ],
+        }
+    )
+    action = resolve("app.install_release", port)
+    result = action.run(
+        CTX,
+        {
+            "app_root": "/opt/opspilot/apps/demo",
+            "release_id": "1.0.0",
+            "python_version": "3.12",
+        },
+    )
+    assert result.ok and result.changed is False
+    assert not any("/bin/pip" in t or t.startswith("python") for t in port.joined())
+
+
+def test_install_release_treats_a_missing_lock_file_as_nothing_to_install() -> None:
+    port = ScriptedPort(
+        {
+            "test": [
+                ExecResult(exit_code=1, stdout="", stderr="", argv=()),  # no release dir
+                ExecResult(exit_code=1, stdout="", stderr="", argv=()),  # no venv
+                ExecResult(exit_code=1, stdout="", stderr="", argv=()),  # no lock
+            ],
+            "mkdir": [_ok()],
+            "tar": [_ok()],
+            "python3.12": [_ok()],
+        }
+    )
+    action = resolve("app.install_release", port)
+    result = action.run(
+        CTX,
+        {
+            "app_root": "/opt/opspilot/apps/demo",
+            "release_id": "1.0.0",
+            "python_version": "3.12",
+        },
+    )
+    assert result.ok
+    assert not any("/bin/pip" in t for t in port.joined())
+
+
+def test_install_release_refuses_a_lock_file_outside_the_release() -> None:
+    port = RecordingPort()
+    action = resolve("app.install_release", port)
+    with pytest.raises(ValueError):
+        action.run(
+            CTX,
+            {
+                "app_root": "/opt/opspilot/apps/demo",
+                "release_id": "1.0.0",
+                "python_version": "3.12",
+                "requirements": "/etc/passwd",
+            },
+        )
+    with pytest.raises(ValueError):
+        action.run(
+            CTX,
+            {
+                "app_root": "/opt/opspilot/apps/demo",
+                "release_id": "1.0.0",
+                "python_version": "3.12",
+                "requirements": "../../../etc/passwd",
+            },
+        )
+    assert port.calls == []
+
+
 def test_fetch_release_refuses_a_checksum_mismatch() -> None:
     port = RecordingPort(
         {
@@ -495,6 +720,37 @@ def test_fetch_release_refuses_a_checksum_mismatch() -> None:
     assert result.ok is False
     assert result.data["actual"] == "deadbeef"
     assert not any(t.startswith("tar") for t in port.joined())
+
+
+def test_fetch_release_creates_the_releases_directory_before_curl() -> None:
+    """``curl -o`` cannot create the directory it writes into.
+
+    On a first deploy nothing has created ``releases/`` — ``system.check_disk``
+    only measures its parent — and curl exits 23 ("Failure writing output to
+    destination") for want of a mkdir nobody ran.
+    """
+    port = RecordingPort(
+        {
+            "mkdir": _ok(),
+            "curl": _ok(),
+            "sha256sum": _ok("0" * 64 + "  x.artifact\n"),
+        }
+    )
+    action = resolve("app.fetch_release", port)
+    result = action.run(
+        CTX,
+        {
+            "app_root": "/opt/opspilot/apps/demo",
+            "release_id": "2026-10-12",
+            "source": "https://example.com/app.tar.gz",
+            "checksum": "0" * 64,
+        },
+    )
+    assert result.ok
+    joined = port.joined()
+    made = joined.index("mkdir -p -- /opt/opspilot/apps/demo/releases")
+    fetched = next(i for i, t in enumerate(joined) if t.startswith("curl "))
+    assert made < fetched, "releases/ must exist before curl -o writes into it"
 
 
 @pytest.mark.parametrize(
@@ -522,6 +778,237 @@ def test_fetch_release_refuses_an_unacceptable_source(source: str) -> None:
             },
         )
     assert port.calls == []
+
+
+# ==========================================================================
+# _exists — the probe every "is it already there?" decision rests on
+# ==========================================================================
+class RealTestPort(RecordingPort):
+    """Answers ``test`` by running the real ``/usr/bin/test``.
+
+    A canned ``ExecResult`` cannot tell "the path is missing" from "``test``
+    was called with a syntax error" — both are a non-zero exit. Only the real
+    binary can, which is exactly how ``test -e -- <path>`` survived: it always
+    returned False and every caller believed the path was absent.
+    """
+
+    def run(
+        self,
+        ctx: ExecContext,
+        argv: Sequence[str],
+        *,
+        stdin: bytes | str | None = None,
+    ) -> ExecResult:
+        tokens = tuple(argv)
+        self.calls.append((tokens, stdin))
+        if tokens[0] != "test":
+            return super().run(ctx, argv, stdin=stdin)
+        proc = subprocess.run(["/usr/bin/test", *tokens[1:]], capture_output=True)
+        return ExecResult(
+            exit_code=proc.returncode,
+            stdout=proc.stdout.decode("utf-8", "replace"),
+            stderr=proc.stderr.decode("utf-8", "replace"),
+            argv=tokens,
+        )
+
+
+def test_exists_tells_a_missing_path_from_a_bad_invocation(tmp_path: Path) -> None:
+    """``test`` must actually answer, not error out on its own argv.
+
+    POSIX ``test`` does not honour ``--`` as end-of-options: ``test -e -- /x``
+    has three operands and ``test`` reads ``--`` as a binary operator, exiting
+    2 with "binary operator expected". That looks exactly like "absent", so
+    releases appeared uninstalled and ``app.switch_current`` refused them.
+    """
+    present = tmp_path / "here"
+    present.write_text("x", encoding="utf-8")
+    port = RealTestPort()
+    action = resolve("app.switch_current", port)
+    assert isinstance(action, AppSwitchCurrent)
+
+    assert action._exists(CTX, str(present)) is True
+    assert action._exists(CTX, str(tmp_path / "gone")) is False
+    # Both probes must have produced a *valid* test(1) invocation.
+    for tokens, _ in port.calls:
+        assert tokens[0] == "test"
+        assert "--" not in tokens, f"test(1) must not be given '--': {tokens}"
+
+
+# ==========================================================================
+# app.switch_current — the atomic release switch
+# ==========================================================================
+class ScriptedPort(RecordingPort):
+    """Answers by ``argv[0]``, popping from a queue per command.
+
+    The switch reads ``current`` twice and the two answers differ, which a
+    single canned response per command name cannot express.
+    """
+
+    def __init__(self, script: dict[str, list[ExecResult]]) -> None:
+        super().__init__()
+        self._script = {k: list(v) for k, v in script.items()}
+
+    def run(
+        self,
+        ctx: ExecContext,
+        argv: Sequence[str],
+        *,
+        stdin: bytes | str | None = None,
+    ) -> ExecResult:
+        tokens = tuple(argv)
+        self.calls.append((tokens, stdin))
+        queue = self._script.get(tokens[0] if tokens else "")
+        if queue:
+            canned = queue.pop(0)
+            return ExecResult(
+                exit_code=canned.exit_code,
+                stdout=canned.stdout,
+                stderr=canned.stderr,
+                argv=tokens,
+            )
+        return ExecResult(exit_code=0, stdout="", stderr="", argv=tokens)
+
+
+def test_switch_current_is_one_rename_over_the_old_link() -> None:
+    """Build the new link aside, then rename it into place.
+
+    Unlink-then-symlink leaves a window with no ``current`` at all, and a
+    process restarting inside that window comes up against nothing. ``mv -T``
+    is the single syscall that closes it, and ``-T`` is required or the move
+    lands *inside* the directory the old link points at.
+    """
+    port = ScriptedPort(
+        {
+            "test": [_ok(), _ok()],  # release dir exists, scratch already gone
+            "readlink": [_ok(""), _ok("releases/1.0.0\n")],
+            "rm": [_ok()],
+            "ln": [_ok()],
+            "mv": [_ok()],
+        }
+    )
+    action = resolve("app.switch_current", port)
+    result = action.run(
+        CTX, {"app_root": "/opt/opspilot/apps/demo", "release_id": "1.0.0"}
+    )
+    assert result.ok and result.changed
+    joined = port.joined()
+    assert "ln -s -- releases/1.0.0 /opt/opspilot/apps/demo/.current.opspilot-new" in joined
+    assert (
+        "mv -Tf -- /opt/opspilot/apps/demo/.current.opspilot-new /opt/opspilot/apps/demo/current"
+        in joined
+    )
+    # Nothing may remove the live link before the replacement is in place.
+    assert not any(t.startswith("rm -f -- /opt/opspilot/apps/demo/current") for t in joined)
+    assert not any("ln -sfn" in t for t in joined)
+
+
+def test_switch_current_is_skipped_when_current_already_points_there() -> None:
+    port = ScriptedPort(
+        {"test": [_ok()], "readlink": [_ok("releases/1.0.0\n")]}
+    )
+    action = resolve("app.switch_current", port)
+    result = action.run(
+        CTX, {"app_root": "/opt/opspilot/apps/demo", "release_id": "1.0.0"}
+    )
+    assert result.ok and result.changed is False
+    assert not any(t.startswith("mv") for t in port.joined())
+
+
+def test_switch_current_reports_the_link_it_replaced() -> None:
+    port = ScriptedPort(
+        {
+            "test": [_ok(), _ok()],
+            "readlink": [_ok("releases/0.9.0\n"), _ok("releases/1.0.0\n")],
+            "rm": [_ok()],
+            "ln": [_ok()],
+            "mv": [_ok()],
+        }
+    )
+    action = resolve("app.switch_current", port)
+    result = action.run(
+        CTX, {"app_root": "/opt/opspilot/apps/demo", "release_id": "1.0.0"}
+    )
+    assert result.ok
+    assert result.data["previous"] == "releases/0.9.0"
+    assert result.data["current"] == "releases/1.0.0"
+
+
+def test_switch_current_refuses_when_the_release_is_not_installed() -> None:
+    port = ScriptedPort({"test": [ExecResult(exit_code=1, stdout="", stderr="", argv=())]})
+    action = resolve("app.switch_current", port)
+    result = action.run(
+        CTX, {"app_root": "/opt/opspilot/apps/demo", "release_id": "1.0.0"}
+    )
+    assert result.ok is False
+    assert "not installed" in result.summary
+    assert not any(t.startswith(("ln", "mv")) for t in port.joined())
+
+
+def test_switch_current_refuses_to_move_onto_shared_state() -> None:
+    port = RecordingPort()
+    action = resolve("app.switch_current", port)
+    with pytest.raises(ValueError):
+        action.run(
+            CTX,
+            {"app_root": "/opt/opspilot/apps/demo/shared", "release_id": "1.0.0"},
+        )
+    assert port.calls == []
+
+
+@pytest.mark.parametrize("release_id", ["latest", "current", "shared", "releases", "ops"])
+def test_switch_current_refuses_a_reserved_release_id(release_id: str) -> None:
+    port = RecordingPort()
+    action = resolve("app.switch_current", port)
+    with pytest.raises(ValueError):
+        action.run(
+            CTX, {"app_root": "/opt/opspilot/apps/demo", "release_id": release_id}
+        )
+    assert port.calls == []
+
+
+def test_switch_current_puts_a_previous_release_back() -> None:
+    """A rollback is the same action pointed at the old release.
+
+    Nothing about undo is special: it is a switch to a release that is already
+    on the host, so it must not fetch or unpack anything.
+    """
+    port = ScriptedPort(
+        {
+            "test": [_ok(), _ok()],
+            "readlink": [_ok("releases/1.0.0\n"), _ok("releases/0.9.0\n")],
+            "rm": [_ok()],
+            "ln": [_ok()],
+            "mv": [_ok()],
+        }
+    )
+    action = resolve("app.switch_current", port)
+    result = action.run(
+        CTX, {"app_root": "/opt/opspilot/apps/demo", "release_id": "0.9.0"}
+    )
+    assert result.ok and result.data["previous"] == "releases/1.0.0"
+    assert not any(t.startswith(("curl", "tar", "mkdir")) for t in port.joined())
+
+
+def test_switch_current_gives_up_and_cleans_up_if_the_rename_fails() -> None:
+    port = ScriptedPort(
+        {
+            "test": [_ok(), _ok()],
+            "readlink": [_ok(""), _ok("releases/0.9.0\n")],
+            "rm": [_ok(), _ok()],
+            "ln": [_ok()],
+            "mv": [ExecResult(exit_code=1, stdout="", stderr="cross-device", argv=())],
+        }
+    )
+    action = resolve("app.switch_current", port)
+    result = action.run(
+        CTX, {"app_root": "/opt/opspilot/apps/demo", "release_id": "1.0.0"}
+    )
+    assert result.ok is False
+    # The staged link is removed, and the live one is never touched.
+    assert (
+        "rm -f -- /opt/opspilot/apps/demo/.current.opspilot-new" in port.joined()
+    )
+    assert not any("apps/demo/current" in t and t.startswith("rm") for t in port.joined())
 
 
 # ==========================================================================
@@ -668,6 +1155,146 @@ def test_render_unit_stages_the_body_out_of_argv() -> None:
     assert result.data["daemon_reloaded"] is True
 
 
+def test_render_unit_reports_a_stage_dir_it_cannot_create() -> None:
+    """A stage dir the SSH user cannot make must say so.
+
+    Blaming the `dd` instead sends an operator looking at the destination, not
+    at the scratch directory that was never created.
+    """
+    port = RecordingPort(
+        {
+            "test": ExecResult(exit_code=1, stdout="", stderr="", argv=()),
+            "/usr/bin/install": _ok(),
+            "mkdir": ExecResult(
+                exit_code=1, stdout="", stderr="Permission denied", argv=()
+            ),
+            "dd": ExecResult(
+                exit_code=1,
+                stdout="",
+                stderr="dd: failed to open '…': No such file or directory",
+                argv=(),
+            ),
+        }
+    )
+    action = resolve("systemd.render_unit", port)
+    result = action.run(
+        CTX,
+        {"unit_path": "/etc/systemd/system/opspilot-demo.service", "content": "[Service]\n"},
+    )
+
+    assert result.ok is False
+    assert "/opt/opspilot/test" in result.summary
+    assert not any(t.startswith("dd ") for t in port.joined())
+
+
+def test_render_unit_accepts_a_current_path_that_is_not_linked_yet() -> None:
+    """§8.2 writes the unit *before* flipping ``current``.
+
+    A version-agnostic unit names ``<app_root>/current/...``, so at verify time
+    that binary is not supposed to exist. Failing here would force the link to
+    flip before the unit is installed — the exact ordering the design avoids.
+    """
+    stderr = (
+        "opspilot-demo.service: Command "
+        "/opt/opspilot/apps/demo/current/venv/bin/python is not executable:"
+        " No such file or directory\n"
+    )
+    port = RecordingPort(
+        {
+            "test": ExecResult(exit_code=1, stdout="", stderr="", argv=()),
+            "/usr/bin/install": _ok(),
+            "dd": _ok(),
+            "rm": _ok(),
+            "/usr/bin/systemd-analyze": ExecResult(
+                exit_code=1, stdout="", stderr=stderr, argv=()
+            ),
+            "/usr/bin/systemctl": _ok(),
+        }
+    )
+    action = resolve("systemd.render_unit", port)
+    result = action.run(
+        CTX,
+        {"unit_path": "/etc/systemd/system/opspilot-demo.service", "content": "[Service]\n"},
+    )
+
+    assert result.ok
+    assert result.data["exec_start_pending"] is True
+    assert any("daemon-reload" in t for t in port.joined())
+
+
+def test_render_unit_still_refuses_a_missing_binary_elsewhere() -> None:
+    """A missing binary that is not behind ``current/`` is just broken."""
+    stderr = (
+        "opspilot-demo.service: Command /usr/local/bin/typo is not executable:"
+        " No such file or directory\n"
+    )
+    port = RecordingPort(
+        {
+            "test": ExecResult(exit_code=1, stdout="", stderr="", argv=()),
+            "/usr/bin/install": _ok(),
+            "dd": _ok(),
+            "rm": _ok(),
+            "/usr/bin/systemd-analyze": ExecResult(
+                exit_code=1, stdout="", stderr=stderr, argv=()
+            ),
+        }
+    )
+    action = resolve("systemd.render_unit", port)
+    result = action.run(
+        CTX,
+        {"unit_path": "/etc/systemd/system/opspilot-demo.service", "content": "[Service]\n"},
+    )
+
+    assert result.ok is False
+    assert "/usr/local/bin/typo" in str(result.data)
+    assert not any("daemon-reload" in t for t in port.joined())
+
+
+def test_render_unit_refuses_a_verify_that_exits_badly_with_no_explanation() -> None:
+    """Empty stderr is not an explained exit — do not guess that it is fine."""
+    port = RecordingPort(
+        {
+            "test": ExecResult(exit_code=1, stdout="", stderr="", argv=()),
+            "/usr/bin/install": _ok(),
+            "dd": _ok(),
+            "rm": _ok(),
+            "/usr/bin/systemd-analyze": ExecResult(
+                exit_code=3, stdout="", stderr="", argv=()
+            ),
+        }
+    )
+    action = resolve("systemd.render_unit", port)
+    result = action.run(
+        CTX,
+        {"unit_path": "/etc/systemd/system/opspilot-demo.service", "content": "[Service]\n"},
+    )
+
+    assert result.ok is False
+    assert not any("daemon-reload" in t for t in port.joined())
+
+
+def test_classify_verify_output_drops_systemd_warnings_only() -> None:
+    problems, deferred = classify_verify_output(
+        "u.service:7: Missing '=', ignoring line.\n"
+        "u.service: Unknown section 'Garbage'. Ignoring.\n"
+    )
+    assert (problems, deferred) == ([], [])
+
+    problems, deferred = classify_verify_output(
+        "u.service: Service has no ExecStart=, ExecStop=, or SuccessAction=. Refusing.\n"
+        "Unit u.service has a bad unit file setting.\n"
+    )
+    assert deferred == []
+    assert len(problems) == 2
+
+    problems, deferred = classify_verify_output(
+        "u.service: Command /opt/opspilot/apps/demo/current/venv/bin/python"
+        " is not executable: No such file or directory\n"
+    )
+    assert problems == []
+    assert len(deferred) == 1
+
+
 # ==========================================================================
 # mysql / redis — read-only, and they prove it
 # ==========================================================================
@@ -717,7 +1344,8 @@ def test_redis_precheck_never_writes_an_existing_config() -> None:
 
     assert result.ok
     assert result.data["config_overwritten"] is False
-    assert port.joined() == ["test -e -- /etc/redis/redis.conf"]
+    # No `--`: POSIX test(1) reads it as an operand and errors out.
+    assert port.joined() == ["test -e /etc/redis/redis.conf"]
     assert not any(t.split()[0] in {"dd", "mv", "cp", "tee", "install"} for t in port.joined())
 
 

@@ -14,12 +14,13 @@ import json
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, Query, Request, Response
+from fastapi import Depends, Header, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from shared.redaction import redact, redact_text
 from shared.task_protocol import TaskLog, is_run_terminal, is_task_terminal
 from sqlalchemy import select
 
+from backend.app.api.routing import AppRouter
 from backend.app.auth.deps import DbSession, require_permission
 from backend.app.auth.models import User
 from backend.app.auth.service import AuthService
@@ -39,7 +40,7 @@ from backend.app.orchestrator.schemas import (
 )
 from backend.app.orchestrator.service import TaskService
 
-router = APIRouter(prefix="/tasks", tags=["tasks"])
+router = AppRouter(prefix="/tasks", tags=["tasks"])
 
 CanRead = Annotated[User, Depends(require_permission("task.read"))]
 CanCreate = Annotated[User, Depends(require_permission("task.create"))]
@@ -181,7 +182,7 @@ def retry_task(
 # --------------------------------------------------------------------------
 # Runs
 # --------------------------------------------------------------------------
-run_router = APIRouter(prefix="/task-runs", tags=["tasks"])
+run_router = AppRouter(prefix="/task-runs", tags=["tasks"])
 
 
 @run_router.get("/{run_id}/logs", response_model=TaskLogPage)

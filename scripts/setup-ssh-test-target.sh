@@ -25,7 +25,7 @@ set -euo pipefail
 KEY_DIR=/etc/opspilot/ssh-test
 TARGET_USER=opstest
 APP_ROOT=/opt/opspilot/apps
-TEST_ROOT=/opt/opspilot-test
+TEST_ROOT=/opt/opspilot/test
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

@@ -54,8 +54,12 @@ class Task(Base, TimestampMixin):
     )
 
     id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, autoincrement=True)
-    # Client-supplied `Idempotency-Key`. Empty string = "no dedupe requested".
-    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    # Client-supplied `Idempotency-Key`. NULL = "no dedupe requested" — and
+    # NULL is the only value a UNIQUE index allows more than once, which is why
+    # the absence of a key is encoded that way rather than as ''.
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, default=None
+    )
     # What to do, e.g. "server.check", "template.apply", "deployment.publish".
     kind: Mapped[str] = mapped_column(String(64), nullable=False)
     title: Mapped[str] = mapped_column(Name, nullable=False, default="")

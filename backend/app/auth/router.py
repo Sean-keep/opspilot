@@ -5,9 +5,10 @@ from __future__ import annotations
 import time
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import Depends, Request
 from sqlalchemy import select
 
+from backend.app.api.routing import AppRouter
 from backend.app.audit.models import RESULT_FAILURE, RESULT_SUCCESS
 from backend.app.audit.service import write_audit
 from backend.app.auth.deps import (
@@ -24,7 +25,7 @@ from backend.app.core.security import create_access_token
 from backend.app.core.settings import get_settings
 
 log = get_logger(__name__)
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = AppRouter(prefix="/auth", tags=["auth"])
 
 # Permission-scoped callers. The dependency both authenticates and authorises.
 CanCreateUser = Annotated[User, Depends(require_permission("user.create"))]

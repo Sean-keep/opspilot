@@ -31,6 +31,10 @@ from shared.task_protocol import (
     RUN_SUCCESS,
     RUN_UNKNOWN,
     RUN_WAITING,
+    STEP_RUNNING,
+    STEP_SUCCESS,
+    STEP_TERMINAL,
+    STEP_UNKNOWN,
     TASK_CANCELLED,
     TASK_CANCELLING,
     TASK_PARTIAL_SUCCESS,
@@ -109,6 +113,30 @@ def _make_run(
     session.add(run)
     session.flush()
     return run
+
+
+def _make_step(
+    session: Session,
+    run: TaskRun,
+    *,
+    step_key: str = "ensure_user",
+    action: str = "system.ensure_user",
+    status: str = STEP_RUNNING,
+    idempotency_class: str = IDEMPOTENCY_DESTRUCTIVE,
+    attempt: int | None = None,
+) -> TaskStep:
+    step = TaskStep(
+        run_id=run.id,
+        step_key=step_key,
+        attempt=run.attempt if attempt is None else attempt,
+        action=action,
+        status=status,
+        idempotency_class=idempotency_class,
+        started_at=utcnow(),
+    )
+    session.add(step)
+    session.flush()
+    return step
 
 
 def _factory(engine: Engine) -> sessionmaker[Session]:
@@ -450,6 +478,83 @@ class TestLeaseRecovery:
         assert row.evidence is not None
         assert "hunter2" not in str(row.evidence)
         assert "10.0.0.1" in str(row.evidence)
+
+    # -- steps left behind by the dead worker ------------------------------
+    #
+    # Caught in the live S4 recovery drill: a deploy SIGKILLed mid
+    # ``ensure_user`` came back with the run parked ``UNKNOWN`` while the step
+    # still read ``RUNNING``. Nothing was running. The run was judged; the step
+    # record had to be judged too.
+    def test_recovery_closes_the_step_it_died_on(self, db: Session) -> None:
+        run = self._expired_run(db)
+        step = _make_step(db, run, step_key="ensure_user", status=STEP_RUNNING)
+        _make_step(
+            db, run, step_key="check_os", status=STEP_SUCCESS,
+            idempotency_class=IDEMPOTENCY_SAFE,
+        )
+        db.commit()
+
+        apply_recovery(
+            db, run_id=run.id, decision=DECISION_UNKNOWN, probe=PROBE_FINISHED,
+            decided_by="recovery",
+        )
+        db.refresh(step)
+        assert step.status == STEP_UNKNOWN
+        assert step.finished_at is not None
+
+    def test_recovery_leaves_a_finished_step_alone(self, db: Session) -> None:
+        run = self._expired_run(db)
+        done = _make_step(
+            db, run, step_key="check_os", status=STEP_SUCCESS,
+            idempotency_class=IDEMPOTENCY_SAFE,
+        )
+        db.commit()
+
+        apply_recovery(
+            db, run_id=run.id, decision=DECISION_UNKNOWN, probe=PROBE_FINISHED,
+            decided_by="recovery",
+        )
+        db.refresh(done)
+        assert done.status == STEP_SUCCESS
+        assert done.finished_at is None
+
+    def test_requeue_leaves_no_step_claiming_to_run(self, db: Session) -> None:
+        """A requeued attempt is abandoned; its steps must not look live."""
+        run = self._expired_run(db)
+        _make_step(db, run, step_key="check_os", status=STEP_SUCCESS,
+                   idempotency_class=IDEMPOTENCY_SAFE)
+        _make_step(db, run, step_key="collect_facts", status=STEP_RUNNING,
+                   idempotency_class=IDEMPOTENCY_SAFE)
+        db.commit()
+
+        apply_recovery(
+            db, run_id=run.id, decision=DECISION_REQUEUE, probe=PROBE_FINISHED,
+            decided_by="recovery",
+        )
+        db.refresh(run)
+        assert run.status == RUN_WAITING
+        still_running = list(
+            db.execute(
+                select(TaskStep).where(
+                    TaskStep.run_id == run.id,
+                    TaskStep.status.notin_(sorted(STEP_TERMINAL)),
+                )
+            ).scalars()
+        )
+        assert still_running == []
+
+    def test_renew_keeps_the_step_running_because_the_remote_is(self, db: Session) -> None:
+        run = self._expired_run(db)
+        step = _make_step(db, run, step_key="install_release", status=STEP_RUNNING)
+        db.commit()
+
+        apply_recovery(
+            db, run_id=run.id, decision=DECISION_RENEW, probe=PROBE_STILL_RUNNING,
+            decided_by="recovery",
+        )
+        db.refresh(step)
+        assert step.status == STEP_RUNNING
+        assert step.finished_at is None
 
 
 # --------------------------------------------------------------------------

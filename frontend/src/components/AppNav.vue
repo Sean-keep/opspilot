@@ -26,8 +26,8 @@ const NAV_ITEMS: readonly NavItem[] = [
   { label: '凭据', routeName: 'credentials', permissions: ['credential.read'] },
   { label: '模板', routeName: null, permissions: ['template.read'] },
   { label: '任务', routeName: 'tasks', permissions: ['task.read'] },
-  { label: '应用', routeName: null, permissions: ['app.read'] },
-  { label: '发布记录', routeName: null, permissions: ['deployment.read'] },
+  { label: '应用', routeName: 'applications', permissions: ['app.read'] },
+  { label: '发布记录', routeName: 'deployments', permissions: ['deployment.read'] },
   { label: '审计日志', routeName: null, permissions: ['audit.read'] },
 ]
 

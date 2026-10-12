@@ -67,7 +67,7 @@ shared  ◄────  backend
 | `catalog/` | 模板目录、版本、校验 | S3 |
 | `applications/` | 应用与环境定义 | S4 |
 | `deployments/` | 发布记录、软链接切换、回滚任务 | S4 |
-| `artifacts/` | 制品下载与校验和 | S4 |
+| `artifacts/` | 制品仓库（V1 未实现；下载与校验和在 `app.fetch_release` 里） | S4 |
 | `notifications/` | Telegram、Outbox | S2+ |
 
 模块之间只通过服务层（`service.py`）和 ORM 模型交互，路由层不直接拼 SQL。

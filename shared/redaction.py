@@ -154,6 +154,47 @@ def redact(obj: Any, *, depth: int = 0, max_depth: int = 24) -> Any:
     return obj
 
 
+#: Parameter names whose value is a **file body** rather than a scalar. These
+#: travel over stdin to the host and must never be persisted: a rendered env
+#: file or systemd unit is exactly where a deployment puts a secret, and
+#: ``ops_task_steps.params_json`` is a database column that the task API hands
+#: back to anyone with ``task.read``.
+CONTENT_PARAM_KEYS: frozenset[str] = frozenset({"content", "body", "stdin"})
+
+
+def redact_params(params: Any, *, depth: int = 0, max_depth: int = 24) -> Any:
+    """Shape a step's parameters for persistence.
+
+    Two passes, because they catch different things:
+
+    * :func:`redact` for values that are secret by *name* or by *shape*
+    * file bodies replaced by their size, which is what an operator actually
+      needs from a log ("wrote 412 bytes", not "wrote the password")
+
+    The result is what goes in ``params_json``. The real parameters are what
+    the action runs with — this is a view for the record, never a rewrite of
+    the call.
+    """
+    scrubbed = redact(params, depth=depth, max_depth=max_depth)
+    if isinstance(scrubbed, Mapping):
+        out: dict[Any, Any] = {}
+        for key, value in scrubbed.items():
+            if isinstance(key, str) and _normalize_key(key) in CONTENT_PARAM_KEYS:
+                out[key] = _size_marker(value)
+            else:
+                out[key] = value
+        return out
+    return scrubbed
+
+
+def _size_marker(value: Any) -> str:
+    if isinstance(value, str):
+        return f"[BODY {len(value.encode('utf-8'))} bytes]"
+    if isinstance(value, (bytes, bytearray)):
+        return f"[BODY {len(value)} bytes]"
+    return "[BODY]"
+
+
 def redact_text(text: str) -> str:
     """Best-effort redaction of inline secrets inside a free-form log line.
 

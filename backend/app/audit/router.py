@@ -5,13 +5,14 @@ from __future__ import annotations
 import datetime as dt
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import Depends, Query
 from pydantic import BaseModel, ConfigDict
 
+from backend.app.api.routing import AppRouter
 from backend.app.audit.service import AuditService
 from backend.app.auth.deps import DbSession, require_permission
 
-router = APIRouter(prefix="/audit-logs", tags=["audit"])
+router = AppRouter(prefix="/audit-logs", tags=["audit"])
 
 CanReadAudit = Annotated[object, Depends(require_permission("audit.read"))]
 

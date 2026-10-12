@@ -62,10 +62,13 @@ log = get_logger(__name__)
 
 IDEMPOTENCY_SCOPE = "POST /api/v1/tasks"
 
-#: Task kinds the S2 engine will actually run. S3 widens this to the Action
-#: Registry; until then anything else is rejected at submit time rather than
-#: silently sitting in the queue forever.
-S2_TASK_KINDS: frozenset[str] = frozenset({"server.check"})
+#: Task kinds this engine will actually run. Kept in lockstep with
+#: ``worker.runner.SUPPORTED_KINDS``: a kind one side accepts and the other
+#: ignores is a task that sits in the queue forever, which is worse than a
+#: rejection at submit time.
+TASK_KINDS: frozenset[str] = frozenset(
+    {"server.check", "app.deploy", "app.rollback"}
+)
 
 
 def _hash_request(payload: dict[str, Any]) -> str:
@@ -150,7 +153,7 @@ class TaskService:
             "kind": task.kind,
             "title": task.title,
             "status": task.status,
-            "idempotency_key": task.idempotency_key,
+            "idempotency_key": task.idempotency_key or "",
             "requested_by": task.requested_by,
             "requested_by_name": task.requested_by_name,
             "queued_at": task.queued_at,
@@ -222,14 +225,14 @@ class TaskService:
         The outbox row commits in the same transaction as the task, so there is
         no window where the database has work that nothing will pick up.
         """
-        if kind not in S2_TASK_KINDS:
+        if kind not in TASK_KINDS:
             raise ValidationError(
-                f"unsupported task kind {kind!r}; S2 accepts {sorted(S2_TASK_KINDS)}"
+                f"unsupported task kind {kind!r}; accepted kinds are {sorted(TASK_KINDS)}"
             )
         if not server_ids:
             raise ValidationError("a task needs at least one target server")
 
-        key = (idempotency_key or "").strip()
+        key = (idempotency_key or "").strip() or None
         if key:
             existing = self.session.execute(
                 select(ApiIdempotency).where(

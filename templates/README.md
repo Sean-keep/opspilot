@@ -66,3 +66,18 @@ DRAFT ──► VALIDATED ──► TESTED ──► PUBLISHED ──► DEPRECA
 
 `mysql-precheck` 是「绝不初始化已有数据目录」这条硬约束的可执行表达：它只探不写，
 且 `expect_existing_datadir` 是模板里写死的，调用方**不能**通过入参打开初始化。
+
+## `system.check_os` 的 `expect` 取什么值
+
+模板里的 `expect: ["ubuntu-22.04", "ubuntu-24.04", "debian-12"]` 匹配的**不是**
+`/etc/os-release` 的原文，而是从里面解析出的平台标识 `<ID>-<VERSION_ID>`（或只有 `<ID>`）。
+拿原文做子串匹配是匹配不上的 —— `ubuntu-24.04` 不是 os-release 任何一行的子串，
+那条路在真实机器上每次都会失败。词汇表见 [../docs/deployment.md](../docs/deployment.md)。
+
+## 这里没有「发布计划」
+
+S4 的应用发布链路（§8.2 那 11 步、软链接原子切换、失败恢复）**不是**一份模板，而是
+`shared/deploy_plan.py` 里写死的计划 —— 它的顺序、不归零点和恢复策略是安全边界，
+不能靠一份可编辑的 YAML 表达。`application/python-app` 是把同类步骤当**模板**用的示例，
+两条路都调同一批 Action，但只有前者会被发布记录驱动。见
+[../docs/deployment.md](../docs/deployment.md)。

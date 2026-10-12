@@ -21,12 +21,21 @@ from __future__ import annotations
 import datetime as dt
 import json
 import time
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from typing import Any
 
+from shared.actions.base import resolve as resolve_action
 from shared.checks import CheckError, collect_facts
 from shared.config import Settings
 from shared.crypto import CryptoError, decrypt_secret
 from shared.dbtypes import utcnow
+from shared.deploy_plan import (
+    PlanStep,
+    build_deploy_plan,
+    build_restore_plan,
+    inputs_from_mapping,
+)
 from shared.executor.keys import staged_private_key
 from shared.executor.port import (
     ExecContext,
@@ -34,7 +43,7 @@ from shared.executor.port import (
 )
 from shared.executor.ssh import SshExecPort
 from shared.logsetup import get_logger
-from shared.redaction import redact, redact_text
+from shared.redaction import redact, redact_params, redact_text
 from shared.task_protocol import (
     IDEMPOTENCY_SAFE,
     RUN_CANCELLED,
@@ -50,14 +59,24 @@ from shared.task_protocol import (
     TaskStep,
     ensure_run_transition,
 )
-from shared.task_protocol.claim import ClaimedRun
+from shared.task_protocol.claim import ClaimedRun, renew_leases
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 log = get_logger(__name__)
 
-# The only kind S2 executes. S3 replaces this with the Action Registry.
-SUPPORTED_KINDS = frozenset({"server.check"})
+#: Kinds this worker executes. Widened together with
+#: ``backend.app.orchestrator.service.TASK_KINDS`` — a kind one side accepts and
+#: the other ignores is a task that sits in the queue forever.
+SUPPORTED_KINDS = frozenset({"server.check", "app.deploy", "app.rollback"})
+
+
+class RunBlocked(Exception):
+    """A precondition failed before any remote command could run.
+
+    Distinct from a step failure: nothing was attempted on the host, so there
+    is no partial state to explain or undo.
+    """
 
 # Read-only argv used by server.check. Fixed list, no substitution.
 # (The parsing lives in shared.checks.collect_facts.)
@@ -66,12 +85,23 @@ SUPPORTED_KINDS = frozenset({"server.check"})
 class RunOutcome:
     """What happened to one run, for the caller to log and move on."""
 
-    __slots__ = ("cancelled", "detail", "status")
+    __slots__ = ("cancelled", "detail", "failed_step_key", "status")
 
-    def __init__(self, status: str, detail: str = "", *, cancelled: bool = False) -> None:
+    def __init__(
+        self,
+        status: str,
+        detail: str = "",
+        *,
+        cancelled: bool = False,
+        failed_step_key: str = "",
+    ) -> None:
         self.status = status
         self.detail = detail
         self.cancelled = cancelled
+        #: Which plan step stopped the run. Empty when the run failed before
+        #: or between steps — the deployment restore policy keys off this, so
+        #: "I don't know" must stay distinguishable from "the last one".
+        self.failed_step_key = failed_step_key
 
 
 class Runner:
@@ -210,12 +240,24 @@ class Runner:
             return self._cancel_before_work(run)
 
         self._advance(run, RUN_EXECUTING)
+        self._open_attempt(run)
 
         if self._cancel_requested(run.id):
             return self._cancel_before_work(run)
 
+        handler = {
+            "server.check": self._run_server_check,
+            "app.deploy": self._run_deploy,
+            "app.rollback": self._run_deploy,
+        }[claimed.kind]
+
         try:
-            return self._run_server_check(claimed, run)
+            return handler(claimed, run)
+        except RunBlocked as exc:
+            detail = redact_text(str(exc))
+            self.log(run.id, f"run failed: {detail}", level="error")
+            self._note_check(run, "failed", detail)
+            return self._fail(run, detail)
         except (TransportError, CheckError, CryptoError) as exc:
             detail = redact_text(str(exc))
             self.log(run.id, f"run failed: {detail}", level="error")
@@ -228,6 +270,48 @@ class Runner:
             return self._fail(run, detail)
 
     # ------------------------------------------------------------------
+    # Connection
+    # ------------------------------------------------------------------
+    @contextmanager
+    def _session_to(self, server: dict[str, Any]) -> Iterator[tuple[ExecContext, Any]]:
+        """Stage the key and yield a live ``(ctx, port)`` pair.
+
+        The private key only exists on disk inside this ``with``; the context
+        carries a path, never the material. Anything that needs a command on
+        this host goes through here, which is also where the host-key gate and
+        the credential lookup live — one place to refuse, not three.
+
+        Raises :class:`RunBlocked` rather than returning a half-open session.
+        """
+        credential_id = server.get("credential_id")
+        if not credential_id:
+            raise RunBlocked("server has no credential bound")
+
+        try:
+            secret = decrypt_secret(self._load_credential_payload(int(credential_id)))
+        except (CryptoError, TypeError, ValueError) as exc:
+            raise RunBlocked(redact_text(str(exc))) from exc
+
+        with staged_private_key(secret) as key_path:
+            ctx = ExecContext(
+                host=str(server["hostname"]),
+                port=int(server.get("port") or 22),
+                user=str(server.get("ssh_user") or ""),
+                credential_id=int(credential_id),
+                timeout=self.settings.ssh_command_timeout,
+                host_key_fingerprint=str(server["host_key_fingerprint"]),
+                extra={"key_filename": str(key_path)},
+            )
+            yield ctx, self._make_port()
+
+    def _require_verified_host(self, run: TaskRun, server: dict[str, Any]) -> None:
+        if server.get("host_key_state") != "verified" or not server.get("host_key_fingerprint"):
+            raise RunBlocked(
+                "host key is not verified; an operator must confirm the fingerprint "
+                "before any command runs"
+            )
+
+    # ------------------------------------------------------------------
     def _run_server_check(self, claimed: ClaimedRun, run: TaskRun) -> RunOutcome:
         """Collect system facts and store a snapshot.
 
@@ -238,11 +322,10 @@ class Runner:
         if server is None:
             return self._fail(run, f"server {run.server_id} no longer exists")
 
-        if server.get("host_key_state") != "verified" or not server.get("host_key_fingerprint"):
-            detail = (
-                "host key is not verified; an operator must confirm the fingerprint "
-                "before any command runs"
-            )
+        try:
+            self._require_verified_host(run, server)
+        except RunBlocked as exc:
+            detail = redact_text(str(exc))
             self._note_check(run, "failed", detail)
             return self._fail(run, detail)
 
@@ -257,28 +340,14 @@ class Runner:
         if self._cancel_requested(run.id):
             return self._cancel_during_step(run, step, signal_sent=False, remote_exit=None)
 
-        credential_id = server.get("credential_id")
-        if not credential_id:
-            return self._fail_step(run, step, "server has no credential bound")
-
-        try:
-            secret = decrypt_secret(self._load_credential_payload(int(credential_id)))
-        except (CryptoError, TypeError, ValueError) as exc:
-            return self._fail_step(run, step, redact_text(str(exc)))
-
         started = time.monotonic()
         try:
-            with staged_private_key(secret) as key_path:
-                ctx = ExecContext(
-                    host=str(server["hostname"]),
-                    port=int(server.get("port") or 22),
-                    user=str(server.get("ssh_user") or ""),
-                    credential_id=int(credential_id),
-                    timeout=self.settings.ssh_command_timeout,
-                    host_key_fingerprint=str(server["host_key_fingerprint"]),
-                    extra={"key_filename": str(key_path)},
-                )
-                facts = collect_facts(self._make_port(), ctx)
+            with self._session_to(server) as (ctx, port):
+                facts = collect_facts(port, ctx)
+        except RunBlocked as exc:
+            duration = int((time.monotonic() - started) * 1000)
+            step.duration_ms = duration
+            return self._fail_step(run, step, redact_text(str(exc)))
         except (TransportError, CheckError) as exc:
             duration = int((time.monotonic() - started) * 1000)
             step.duration_ms = duration
@@ -319,8 +388,337 @@ class Runner:
         return self._succeed(run, step)
 
     # ------------------------------------------------------------------
+    # Deployment
+    # ------------------------------------------------------------------
+    def _run_deploy(self, claimed: ClaimedRun, run: TaskRun) -> RunOutcome:
+        """Run the §8.2 plan, and undo the link if the live half fails.
+
+        The rule that matters: every step *before* ``switch_current`` can fail
+        without touching what is live, so a failure there just stops. Every
+        step from the switch on can leave the host on a release that does not
+        work, so those failures put the previous release back first and only
+        then report — and the deployment record says ``ROLLED_BACK`` rather
+        than ``FAILED``, because those are different facts.
+
+        A first deploy has no previous release and therefore no undo. That is
+        surfaced as ``FAILED`` with an explicit note, not as a quiet success.
+        """
+        params = dict(claimed.params or {})
+        raw = dict(params.get("deploy") or {})
+        deployment_id = int(params.get("deployment_id") or 0)
+        try:
+            inputs = inputs_from_mapping(
+                raw, secrets=self._load_config_secrets(self._config_ref(params, raw))
+            )
+        except (ValueError, TypeError) as exc:
+            raise RunBlocked(redact_text(str(exc))) from exc
+
+        try:
+            plan = build_deploy_plan(inputs)
+        except ValueError as exc:
+            raise RunBlocked(redact_text(str(exc))) from exc
+
+        server = self._load_server(run.server_id)
+        if server is None:
+            raise RunBlocked(f"server {run.server_id} no longer exists")
+        self._require_verified_host(run, server)
+
+        self._deployment_started(deployment_id, run.id)
+        self.log(
+            run.id,
+            f"{plan.kind} of release {inputs.release_id} "
+            f"({len(plan.steps)} steps) onto {inputs.app_root}",
+        )
+
+        with self._session_to(server) as (ctx, port):
+            outcome = self._run_plan_steps(run, plan.steps, ctx, port)
+
+            if outcome is None:
+                self._deployment_finished(deployment_id, "SUCCEEDED")
+                self.log(run.id, f"release {inputs.release_id} is live")
+                return self._succeed(run, self._last_step(run))
+
+            if outcome.cancelled:
+                # ``_finish_cancel`` already parked the run; only the record left.
+                self._deployment_finished(deployment_id, "CANCELLED", outcome.detail)
+                return outcome
+
+            # A step failed. Was it past the point of no return?
+            failed_key = outcome.failed_step_key
+            failed_index = next(
+                (i for i, s in enumerate(plan.steps) if s.key == failed_key), -1
+            )
+            if failed_index < plan.switch_index:
+                # The live release was never touched.
+                self._deployment_finished(deployment_id, "FAILED", outcome.detail)
+                return self._fail(
+                    run, outcome.detail, failed_step_key=outcome.failed_step_key
+                )
+
+            restore = build_restore_plan(inputs, plan)
+            if not restore:
+                self.log(
+                    run.id,
+                    "the link was flipped and there is no previous release to "
+                    "put back; the host is on the new release and needs a human",
+                    level="error",
+                )
+                self._deployment_finished(deployment_id, "FAILED", outcome.detail)
+                return self._fail(
+                    run, outcome.detail, failed_step_key=outcome.failed_step_key
+                )
+
+            self.log(
+                run.id,
+                f"restoring release {plan.restore_release_id} after {failed_key} failed",
+                level="warning",
+            )
+            restore_outcome = self._run_plan_steps(run, restore, ctx, port)
+            if restore_outcome is not None and not restore_outcome.cancelled:
+                self.log(
+                    run.id,
+                    f"restore failed too: {restore_outcome.detail}",
+                    level="error",
+                )
+                detail = (
+                    f"{outcome.detail}; restore also failed: {restore_outcome.detail}"
+                )
+                self._deployment_finished(deployment_id, "FAILED", detail)
+                return self._fail(
+                    run, detail, failed_step_key=outcome.failed_step_key
+                )
+
+            self._deployment_finished(deployment_id, "ROLLED_BACK", outcome.detail)
+            return self._fail(
+                run,
+                f"{outcome.detail}; rolled back to {plan.restore_release_id}",
+                failed_step_key=outcome.failed_step_key,
+            )
+
+    def _run_plan_steps(
+        self,
+        run: TaskRun,
+        steps: Sequence[PlanStep],
+        ctx: ExecContext,
+        port: Any,
+    ) -> RunOutcome | None:
+        """Run *steps* in order. ``None`` means every one of them succeeded.
+
+        A failure returns a :class:`RunOutcome` **without** touching the run's
+        status: the caller may still have an undo to perform, and a run marked
+        ``FAILED`` is not one you can keep working in. **The caller must
+        therefore transition the run before returning** — a run left in
+        ``EXECUTING`` looks live to lease recovery, gets requeued, and the next
+        execution collides with the step rows this one already wrote.
+        """
+        for item in steps:
+            if self._cancel_requested(run.id):
+                return self._cancel_before_work(run)
+
+            if not self._heartbeat(run):
+                # Someone else's recovery pass took the run. Do not write a
+                # terminal status over theirs — just stop working on it.
+                return RunOutcome(RUN_FAILED, "lease lost mid-run", failed_step_key=item.key)
+
+            step = self._start_step(
+                run,
+                step_key=item.key,
+                action=item.action,
+                idempotency_class=item.idempotency_class,
+                params=item.params,
+            )
+
+            if self._cancel_requested(run.id):
+                return self._cancel_during_step(
+                    run, step, signal_sent=False, remote_exit=None
+                )
+
+            started = time.monotonic()
+            try:
+                action = resolve_action(item.action, port)
+                result = action.run(ctx, action.build_params(item.params).model_dump())
+            except (TransportError, ValueError) as exc:
+                step.duration_ms = int((time.monotonic() - started) * 1000)
+                detail = redact_text(str(exc))
+                self._finish_step_failed(step, detail)
+                self.log(run.id, f"{item.key} failed: {detail}", level="error", step_id=step.id)
+                return RunOutcome(
+                    RUN_FAILED, f"{item.key}: {detail}", failed_step_key=item.key
+                )
+
+            step.duration_ms = int((time.monotonic() - started) * 1000)
+            if not result.ok:
+                detail = redact_text(result.summary or f"{item.action} failed")
+                self._finish_step_failed(step, detail, result=result)
+                self.log(run.id, f"{item.key} failed: {detail}", level="error", step_id=step.id)
+                return RunOutcome(
+                    RUN_FAILED, f"{item.key}: {detail}", failed_step_key=item.key
+                )
+
+            self._finish_step_ok(step, result)
+            self.log(run.id, f"{item.key}: {result.summary}", step_id=step.id)
+        return None
+
+    def _finish_step_ok(self, step: TaskStep, result: Any) -> None:
+        step.status = "SUCCESS"
+        step.finished_at = utcnow()
+        step.exit_code = 0
+        step.result_json = self._result_snapshot(result)
+        self.session.commit()
+
+    def _finish_step_failed(
+        self, step: TaskStep, detail: str, *, result: Any = None
+    ) -> None:
+        step.status = "FAILED"
+        step.finished_at = utcnow()
+        step.result_json = {
+            **(self._result_snapshot(result) if result is not None else {}),
+            "error": detail,
+        }
+        self.session.commit()
+
+    def _result_snapshot(self, result: Any) -> dict[str, Any]:
+        """``ActionResult`` → ``result_json``, redacted on the way in.
+
+        The summary and every argv element go through :func:`redact_text`, and
+        ``data`` through :func:`redact`. This is the last place the result is
+        still structured, so it is the last place that can strip something
+        before it becomes a database column.
+        """
+        data = redact(dict(getattr(result, "data", None) or {}))
+        payload: dict[str, Any] = {
+            **(data if isinstance(data, dict) else {"value": data}),
+            "ok": bool(getattr(result, "ok", False)),
+            "changed": bool(getattr(result, "changed", False)),
+            "summary": redact_text(str(getattr(result, "summary", "") or "")),
+            "argv": [redact_text(str(a)) for a in (getattr(result, "argv", ()) or ())],
+        }
+        return payload
+
+    def _last_step(self, run: TaskRun) -> TaskStep:
+        return self.session.scalars(
+            select(TaskStep)
+            .where(TaskStep.run_id == run.id)
+            .order_by(TaskStep.id.desc())
+            .limit(1)
+        ).one()
+
+    # -- deployment record (raw SQL: the ORM models live in the API) ------
+    @staticmethod
+    def _config_ref(params: dict[str, Any], deploy: dict[str, Any]) -> str:
+        """Where the environment's secret reference lives.
+
+        On the task params, next to ``deploy`` — the API writes it there, and
+        the deploy mapping itself is the public half. A ref inside ``deploy``
+        is accepted too so a hand-built task does not silently deploy with an
+        empty env.
+        """
+        return str(params.get("config_ref") or deploy.get("config_ref") or "")
+
+    def _load_config_secrets(self, ref: str) -> dict[str, str]:
+        """Resolve ``config_ref`` into the env entries the host needs.
+
+        The reference is on the task; the values never are. Same split as the
+        SSH private key, for the same reason.
+        """
+        if not ref:
+            return {}
+        payload: str | None = self.session.execute(
+            text("SELECT payload_encrypted FROM ops_credentials WHERE secret_ref = :ref"),
+            {"ref": ref},
+        ).scalar_one_or_none()
+        if not payload:
+            raise RunBlocked(f"config_ref {ref!r} does not resolve to a stored secret")
+        plaintext = decrypt_secret(str(payload))
+        try:
+            decoded = json.loads(plaintext)
+        except ValueError as exc:
+            raise RunBlocked(f"config_ref {ref!r} is not a JSON object") from exc
+        if not isinstance(decoded, dict):
+            raise RunBlocked(f"config_ref {ref!r} is not a JSON object")
+        out: dict[str, str] = {}
+        for key, value in decoded.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise RunBlocked(f"config_ref {ref!r} must map strings to strings")
+            out[key] = value
+        return out
+
+    def _deployment_started(self, deployment_id: int, task_id: int) -> None:
+        if not deployment_id:
+            return
+        self.session.execute(
+            text(
+                """
+                UPDATE ops_deployments
+                   SET status = 'RUNNING',
+                       task_id = :tid,
+                       started_at = UTC_TIMESTAMP(3),
+                       updated_at = UTC_TIMESTAMP(3)
+                 WHERE id = :id AND status = 'PENDING'
+                """
+            ),
+            {"id": deployment_id, "tid": task_id},
+        )
+        self.session.commit()
+
+    def _deployment_finished(
+        self, deployment_id: int, status: str, detail: str = ""
+    ) -> None:
+        if not deployment_id:
+            return
+        self.session.execute(
+            text(
+                """
+                UPDATE ops_deployments
+                   SET status = :status,
+                       error_detail = :detail,
+                       finished_at = UTC_TIMESTAMP(3),
+                       updated_at = UTC_TIMESTAMP(3)
+                 WHERE id = :id
+                """
+            ),
+            {"id": deployment_id, "status": status, "detail": detail[:512]},
+        )
+        self.session.commit()
+
+    # ------------------------------------------------------------------
     # Step helpers
     # ------------------------------------------------------------------
+    def _open_attempt(self, run: TaskRun) -> None:
+        """Advance ``run.attempt`` past anything already recorded for this run.
+
+        ``claim_runs`` and ``apply_recovery`` deliberately leave ``attempt``
+        alone: the bump belongs to the worker that actually re-executes, so a
+        crash between requeue and re-claim cannot skip a number. Steps are
+        unique on ``(run_id, step_key, attempt)``, so re-running at the number a
+        dead worker used would collide with rows it already wrote — and the
+        resulting ``IntegrityError`` poisons the session and the run for good.
+        """
+        used = self.session.scalar(
+            select(func.max(TaskStep.attempt)).where(TaskStep.run_id == run.id)
+        )
+        if used is not None and int(used) >= int(run.attempt):
+            run.attempt = int(used) + 1
+            self.session.commit()
+
+    def _heartbeat(self, run: TaskRun) -> bool:
+        """Push the lease out mid-run. False means we no longer own the run.
+
+        A deploy runs for minutes and ``lease_seconds`` is tens of seconds.
+        Without this the lease lapses while this worker is still busy, recovery
+        treats the run as orphaned, and a second execution writes the same step
+        rows as the first. ``renew_leases`` only updates rows we still own, so a
+        drop is a real loss rather than a clock quirk — stop, and let whoever
+        holds it now finish the job.
+        """
+        renewed = renew_leases(
+            self.session,
+            owner=self.worker_id,
+            run_ids=[run.id],
+            lease_seconds=self.settings.lease_seconds,
+        )
+        return renewed == 1
+
     def _start_step(
         self,
         run: TaskRun,
@@ -337,7 +735,10 @@ class Runner:
             action=action,
             status="RUNNING",
             idempotency_class=idempotency_class,
-            params_json=dict(params),
+            # What we persist, not what we run: a rendered env file or unit is
+            # exactly where a deployment puts a secret, and params_json is a
+            # column the task API hands back to anyone with task.read.
+            params_json=redact_params(params),
             started_at=utcnow(),
         )
         self.session.add(step)
@@ -469,7 +870,13 @@ class Runner:
         self.log(run.id, "run succeeded")
         return RunOutcome(RUN_SUCCESS)
 
-    def _fail(self, run: TaskRun, detail: str) -> RunOutcome:
+    def _fail(
+        self,
+        run: TaskRun,
+        detail: str,
+        *,
+        failed_step_key: str = "",
+    ) -> RunOutcome:
         ensure_run_transition(run.status, RUN_FAILED)
         run.status = RUN_FAILED
         run.finished_at = utcnow()
@@ -478,7 +885,7 @@ class Runner:
         run.error_detail = detail[:8000]
         self.session.commit()
         self.log(run.id, f"run failed: {detail}", level="error")
-        return RunOutcome(RUN_FAILED, detail)
+        return RunOutcome(RUN_FAILED, detail, failed_step_key=failed_step_key)
 
     def _fail_step(self, run: TaskRun, step: TaskStep, detail: str) -> RunOutcome:
         step.status = "FAILED"

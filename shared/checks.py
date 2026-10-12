@@ -24,7 +24,7 @@ from shared.executor.port import ExecContext, ExecPort, ExecResult
 
 log = structlog.get_logger(__name__)
 
-__all__ = ["CheckError", "SystemFacts", "collect_facts"]
+__all__ = ["CheckError", "SystemFacts", "collect_facts", "parse_os_release"]
 
 
 class CheckError(Exception):
@@ -90,7 +90,7 @@ def _run(port: ExecPort, ctx: ExecContext, argv: tuple[str, ...]) -> ExecResult:
     return port.run(ctx, list(argv))
 
 
-def _parse_os_release(text: str) -> dict[str, str]:
+def parse_os_release(text: str) -> dict[str, str]:
     """Parse ``/etc/os-release`` without a shell.
 
     Format is ``KEY=VALUE`` per line, value optionally quoted. No nesting, no
@@ -168,7 +168,7 @@ def collect_facts(port: ExecPort, ctx: ExecContext) -> SystemFacts:
             },
         )
 
-    release = _parse_os_release(os_release_raw.stdout)
+    release = parse_os_release(os_release_raw.stdout)
     uname_parts = uname_raw.stdout.strip().split()
     kernel = uname_parts[0] if uname_parts else ""
     arch = uname_parts[-1] if len(uname_parts) >= 3 else ""
