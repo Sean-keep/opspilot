@@ -1,0 +1,36 @@
+api_version: v1
+name: mysql-precheck
+version: 1.0.0
+description: >-
+  Read-only readiness probe for a MySQL instance. Checks the OS, free space on
+  the data directory, and whether MySQL answers on the expected port. This
+  template never creates, initialises, resets, or upgrades a data directory —
+  if the datadir is missing it reports that and stops.
+inputs_schema: schemas/inputs.schema.json
+
+steps:
+  - key: check_os
+    action: system.check_os
+    params:
+      expect: ["ubuntu-22.04", "ubuntu-24.04", "debian-12"]
+
+  - key: check_datadir_space
+    action: system.check_disk
+    params:
+      path: "{{ inputs.datadir }}"
+      min_available_mb: "{{ inputs.min_free_mb }}"
+
+  - key: probe_mysql
+    action: mysql.precheck
+    params:
+      host: "{{ inputs.mysql_host }}"
+      port: "{{ inputs.mysql_port }}"
+      datadir: "{{ inputs.datadir }}"
+      expect_existing_datadir: true
+
+  - key: probe_redis
+    action: redis.precheck
+    params:
+      host: "{{ inputs.redis_host }}"
+      port: "{{ inputs.redis_port }}"
+      config_path: "{{ inputs.redis_config }}"

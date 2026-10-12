@@ -69,6 +69,7 @@ from backend.app.auth.service import (  # noqa: E402
     bootstrap_roles,
 )
 from backend.app.core.settings import Settings, clear_settings_cache, get_settings  # noqa: E402
+from backend.app.db import models as _models  # noqa: E402,F401  — register every table
 from backend.app.db import session as db_session  # noqa: E402
 from backend.app.db.base import Base  # noqa: E402
 

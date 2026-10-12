@@ -58,9 +58,19 @@ URL 里也带了 `init_command` 做同样的事 —— 三层兜底，因为时�
 `ops_lease_recoveries` 记录恢复器每一次裁决，因为「为什么这个 Run 变成了 `UNKNOWN`」
 事后必须能答得出来，而不是靠猜。
 
-### S3
+### S3 已落地（迁移 `0004`）
 
-`ops_templates`、`ops_template_versions`
+| 表 | 用途 |
+|---|---|
+| `ops_templates` | 模板的稳定身份（`name` 唯一）。`latest_version` 只是列表指针，**不是**「跑这个」 |
+| `ops_template_versions` | 每一份 `template.yaml` 对应一行。唯一 `(template_id, version)` |
+
+`ops_template_versions` 的正文列（`spec_json` / `inputs_schema_json` / `checksum`）**只在
+INSERT 时写一次**。MySQL 表达不了「这些列禁止 UPDATE」（除非上触发器），所以由
+`backend/app/catalog/service.py` 拒绝改写，并有测试证明「被拒绝的改写之后正文逐字节不变」。
+
+一旦离开 `DRAFT` 正文即冻结 —— `VALIDATED` / `TESTED` 是对**某一版正文**的结论，在这些状态
+下换正文等于把结论作废。
 
 ### S4
 
@@ -77,6 +87,8 @@ URL 里也带了 `init_command` 做同样的事 —— 三层兜底，因为时�
 | `ops_task_steps` UNIQUE `(run_id, step_key, attempt)` | 同一步骤同一次尝试只有一条记录 |
 | `ops_api_idempotency` UNIQUE `(scope, idempotency_key)` + `request_hash` | 同 key 同 body 回放原响应；同 key 不同 body → 409 |
 | `ops_permissions.code` UNIQUE | 权限码是稳定词汇表 |
+| `ops_templates.name` UNIQUE | 模板名全局唯一，跨分类也不重复 |
+| `ops_template_versions` UNIQUE `(template_id, version)` | 一个版本号只指一份正文 |
 
 S2 的三条任务约束各有集成测试直接撞库断言 `IntegrityError`，不是「应该有」的注释。
 

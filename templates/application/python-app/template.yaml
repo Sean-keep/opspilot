@@ -1,0 +1,88 @@
+api_version: v1
+name: python-app
+version: 1.0.0
+description: >-
+  Deploy a pinned Python application release: fetch and verify the artifact,
+  unpack it beside the shared directories, render its systemd unit, restart
+  the service, and poll a health endpoint. Production callers must pin an
+  explicit release_id — never "latest".
+inputs_schema: schemas/inputs.schema.json
+
+steps:
+  - key: check_os
+    action: system.check_os
+    params:
+      expect: ["ubuntu-22.04", "ubuntu-24.04", "debian-12"]
+
+  - key: check_disk
+    action: system.check_disk
+    params:
+      path: "{{ inputs.app_root }}/releases"
+      min_available_mb: 2048
+
+  - key: ensure_user
+    action: system.ensure_user
+    params:
+      username: "{{ inputs.app_user }}"
+      shell: /usr/sbin/nologin
+
+  - key: fetch_release
+    action: app.fetch_release
+    params:
+      app_root: "{{ inputs.app_root }}"
+      release_id: "{{ inputs.release_id }}"
+      source: "{{ inputs.artifact_url }}"
+      checksum: "{{ inputs.artifact_sha256 }}"
+
+  - key: install_release
+    action: app.install_release
+    params:
+      app_root: "{{ inputs.app_root }}"
+      release_id: "{{ inputs.release_id }}"
+      owner: "{{ inputs.app_user }}"
+
+  - key: render_env
+    action: file.render
+    params:
+      path: "{{ inputs.app_root }}/shared/config/app.env"
+      kind: file
+      mode: "0640"
+      owner: "{{ inputs.app_user }}"
+      content: |
+        APP_ROOT={{ inputs.app_root }}
+        APP_USER={{ inputs.app_user }}
+        APP_PORT={{ inputs.app_port }}
+        APP_RELEASE={{ inputs.release_id }}
+
+  - key: render_unit
+    action: systemd.render_unit
+    params:
+      unit_path: "{{ inputs.unit_path }}"
+      mode: "0644"
+      content: |
+        [Unit]
+        Description=OpsPilot managed application
+        After=network.target
+
+        [Service]
+        Type=simple
+        User={{ inputs.app_user }}
+        WorkingDirectory={{ inputs.app_root }}/current
+        EnvironmentFile={{ inputs.app_root }}/shared/config/app.env
+        ExecStart={{ inputs.app_root }}/current/venv/bin/python -m {{ inputs.module_name }}
+        Restart=on-failure
+
+        [Install]
+        WantedBy=multi-user.target
+
+  - key: restart_service
+    action: systemd.restart
+    params:
+      service: "{{ inputs.service_name }}"
+
+  - key: check_health
+    action: http.check
+    params:
+      url: "{{ inputs.health_url }}"
+      expect_status: 200
+      timeout_seconds: 10

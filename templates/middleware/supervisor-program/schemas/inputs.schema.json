@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "supervisor_program inputs",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["app_user", "app_root", "program_name"],
+  "properties": {
+    "app_user": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]{0,31}$",
+      "default": "opspilot-app",
+      "description": "System account the program runs as."
+    },
+    "app_root": {
+      "type": "string",
+      "pattern": "^/opt/opspilot/apps/[a-z0-9][a-z0-9_-]{0,31}$",
+      "default": "/opt/opspilot/apps/demo",
+      "description": "Root holding releases/, shared/, and current."
+    },
+    "program_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+      "default": "opspilot-demo",
+      "description": "Supervisor program name. Also the restart target."
+    },
+    "program_path": {
+      "type": "string",
+      "pattern": "^/etc/supervisor/conf\\.d/[a-z0-9][a-z0-9_-]{0,31}\\.conf$",
+      "default": "/etc/supervisor/conf.d/opspilot-demo.conf",
+      "description": "Where the program config is written. Must stay under /etc/supervisor/conf.d/."
+    },
+    "module_name": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_]{0,63}(\\.[a-z_][a-z0-9_]{0,63}){0,3}$",
+      "default": "app.worker",
+      "description": "Dotted module executed with python -m."
+    }
+  }
+}

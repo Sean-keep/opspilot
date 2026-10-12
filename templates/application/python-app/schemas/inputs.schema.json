@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "python_app inputs",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["app_user", "app_root", "release_id", "artifact_url", "artifact_sha256"],
+  "properties": {
+    "app_user": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]{0,31}$",
+      "default": "opspilot-app",
+      "description": "System account the application runs as."
+    },
+    "app_root": {
+      "type": "string",
+      "pattern": "^/opt/opspilot/apps/[a-z0-9][a-z0-9_-]{0,31}$",
+      "default": "/opt/opspilot/apps/demo",
+      "description": "Root holding releases/, shared/, and current."
+    },
+    "release_id": {
+      "type": "string",
+      "pattern": "^(?!latest$)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "default": "2026.10.12-1",
+      "description": "Pinned release identifier. The literal 'latest' is refused."
+    },
+    "artifact_url": {
+      "type": "string",
+      "pattern": "^https?://[a-zA-Z0-9.-]+(:[0-9]{1,5})?/.*$",
+      "default": "https://artifacts.example.internal/demo/2026.10.12-1.tar.gz",
+      "description": "Where the release artifact is fetched from. Checksummed before install."
+    },
+    "artifact_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "default": "0000000000000000000000000000000000000000000000000000000000000000",
+      "description": "Expected SHA-256 of the artifact. A mismatch refuses the install."
+    },
+    "app_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 8000,
+      "description": "Port written into the application environment file."
+    },
+    "module_name": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_]{0,63}(\\.[a-z_][a-z0-9_]{0,63}){0,3}$",
+      "default": "app.main",
+      "description": "Dotted module the unit executes with python -m."
+    },
+    "service_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9@_.:-]{0,127}$",
+      "default": "opspilot-demo",
+      "description": "systemd unit name to restart. Must match the restart allowlist."
+    },
+    "unit_path": {
+      "type": "string",
+      "pattern": "^/etc/systemd/system/[a-z0-9][a-z0-9@_.-]{0,127}\\.service$",
+      "default": "/etc/systemd/system/opspilot-demo.service",
+      "description": "Where the unit file is written. No subdirectories."
+    },
+    "health_url": {
+      "type": "string",
+      "pattern": "^https?://[a-zA-Z0-9.-]+(:[0-9]{1,5})?/.*$",
+      "default": "https://demo.example.internal:8443/healthz",
+      "description": "URL polled after the restart. Refused if it points at a metadata address."
+    }
+  }
+}

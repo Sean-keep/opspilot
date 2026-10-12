@@ -1,0 +1,54 @@
+api_version: v1
+name: python312
+version: 1.0.0
+description: >-
+  Prepare a host to run a Python 3.12 application: check the OS and free
+  space, create the application user, and ensure the interpreter exists.
+inputs_schema: schemas/inputs.schema.json
+
+steps:
+  - key: check_os
+    action: system.check_os
+    params:
+      expect: ["ubuntu-22.04", "ubuntu-24.04", "debian-12"]
+
+  - key: check_disk
+    action: system.check_disk
+    params:
+      path: /opt/opspilot/apps
+      min_available_mb: 2048
+
+  - key: ensure_user
+    action: system.ensure_user
+    params:
+      username: "{{ inputs.app_user }}"
+      shell: /usr/sbin/nologin
+
+  - key: install_python
+    action: python.ensure_runtime
+    params:
+      version: "{{ inputs.python_version }}"
+
+  - key: make_app_root
+    action: file.render
+    params:
+      path: "{{ inputs.app_root }}"
+      kind: directory
+      mode: "0750"
+      owner: "{{ inputs.app_user }}"
+
+  - key: make_release_dir
+    action: file.render
+    params:
+      path: "{{ inputs.app_root }}/releases"
+      kind: directory
+      mode: "0750"
+      owner: "{{ inputs.app_user }}"
+
+  - key: make_shared_config
+    action: file.render
+    params:
+      path: "{{ inputs.app_root }}/shared/config"
+      kind: directory
+      mode: "0750"
+      owner: "{{ inputs.app_user }}"

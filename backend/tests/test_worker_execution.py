@@ -46,7 +46,7 @@ class FakePort:
         self.fail = fail
         self.on_run = on_run
 
-    def run(self, ctx: ExecContext, argv: Any) -> ExecResult:
+    def run(self, ctx: ExecContext, argv: Any, *, stdin: Any = None) -> ExecResult:
         self.calls.append(tuple(argv))
         if self.on_run is not None:
             self.on_run()

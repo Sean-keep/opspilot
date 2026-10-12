@@ -61,11 +61,23 @@ class NotVerifiedError(TransportError):
 class ExecPort(Protocol):
     """Something that can run an argv-separated command on a host."""
 
-    def run(self, ctx: ExecContext, argv: Sequence[str]) -> ExecResult:
+    def run(
+        self,
+        ctx: ExecContext,
+        argv: Sequence[str],
+        *,
+        stdin: bytes | str | None = None,
+    ) -> ExecResult:
         """Run *argv* on the host described by *ctx*.
 
         ``argv`` is a list — never a shell string. Implementations must not
         concatenate arguments, must not use ``shell=True``, and must refuse to
         run when the host key is not verified.
+
+        ``stdin`` is the only channel for payload bytes: file contents, a curl
+        config holding a bearer token, anything that must not appear in the
+        audit trail. argv is logged and persisted; stdin is not. Anything
+        sensitive therefore *has* to come in through here rather than as an
+        argument.
         """
         ...

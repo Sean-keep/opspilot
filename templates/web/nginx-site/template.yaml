@@ -1,0 +1,56 @@
+api_version: v1
+name: nginx-site
+version: 1.0.0
+description: >-
+  Render an nginx server block for a managed application and enable it. The
+  configuration is written atomically with a backup; nginx is only reloaded by
+  an explicit restart step the operator can leave out of a dry run.
+inputs_schema: schemas/inputs.schema.json
+
+steps:
+  - key: check_os
+    action: system.check_os
+    params:
+      expect: ["ubuntu-22.04", "ubuntu-24.04", "debian-12"]
+
+  - key: ensure_user
+    action: system.ensure_user
+    params:
+      username: "{{ inputs.app_user }}"
+      shell: /usr/sbin/nologin
+
+  - key: make_www_root
+    action: file.render
+    params:
+      path: "{{ inputs.app_root }}"
+      kind: directory
+      mode: "0750"
+      owner: "{{ inputs.app_user }}"
+
+  - key: render_site
+    action: file.render
+    params:
+      path: "{{ inputs.site_path }}"
+      kind: file
+      mode: "0644"
+      owner: root
+      content: |
+        # Managed by OpsPilot. Edit the template, not this file.
+        server {
+            listen {{ inputs.listen_port }};
+            server_name {{ inputs.server_name }};
+            root {{ inputs.app_root }};
+
+            location / {
+                proxy_pass http://{{ inputs.upstream_host }}:{{ inputs.upstream_port }};
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+            }
+        }
+
+  - key: check_health
+    action: http.check
+    params:
+      url: "{{ inputs.health_url }}"
+      expect_status: 200
+      timeout_seconds: 5

@@ -19,9 +19,12 @@ templates/
         ├── schemas/
         │   └── inputs.schema.json
         └── tests/
-            ├── test_validate.py
-            └── test_idempotency.py
+            ├── test_<name>_validate.py
+            └── test_<name>_idempotency.py
 ```
+
+目录名 = 模板的 `name`（kebab-case）。测试文件名带模板名：`nginx-site` 这种 kebab 名
+永远组不成 Python 包路径，五个 `test_validate.py` 会让 pytest 撞模块名。
 
 ## template.yaml
 
@@ -176,3 +179,109 @@ class FileRender(Action):
 模板参数里可以出现 `secret_ref: "cred:deploy-key"`，表示「这里要填某个凭据的值」。
 渲染时把值填进去；**`params_snapshot_json` 里只存 `secret_ref` 本身**，不存解析出来的值。
 日志经过 `shared/redaction.py` 递归脱敏。
+
+## 四层拒绝
+
+`shared/templates.py` 的校验分四层，**任一层不过就整份模板拒绝**，绝不「好的步骤先跑」。
+四层分开是为了每层都能单独测，也是为了让操作员一次看到全部问题而不是第一个。
+
+| 层 | 拒绝什么 | 实现 |
+|---|---|---|
+| 1 结构 | YAML 不合 `TemplateSpec`（`extra="forbid"`）、步骤 key 重复、`action` 未注册、`name` 与目录不一致 | `TemplateSpec.model_validate` + `spec_of()` |
+| 2 绑定 | 参数名不在 action 的 `model_fields`；`{{ inputs.x }}` 的 `x` 未在 schema 声明；`{{ server.y }}` 的 `y` 不在 `SERVER_VALUE_KEYS` | `validate_template()` |
+| 3 渲染 | `{{ a \| b }}`、`{{ f(x) }}`、`{{ a['b'] }}`、`{% %}`、`{# #}`、`${}`、`$(())`、反引号、不配对的 `{{` / `}}` | `validate_template_text()` |
+| 4 干跑 | 用 schema 的 `default`/`const`/`examples`/`enum` 造探针值渲染，再交给 action 的 Pydantic 模型验一次 | `dry_run_params()` |
+
+第 4 层是「模板能解析，但 action 会拒收这个值」的唯一防线：服务名白名单（`sshd` 不在
+`opspilot-*` 里）、路径白名单、`release_id` 保留字都在这层炸。
+
+## 读路径 vs 写路径
+
+同一个参数名 `path`，规则取决于 action **声明的字段类型**，不是参数名本身：
+
+| 类型 | 规则 | 例子 |
+|---|---|---|
+| `ReadPath` | 绝对、无 `..`、无控制字符 | `system.check_disk.path` 可以是 `/var/lib/mysql` |
+| `RemotePath` | 上面全部 **+** 必须落在 `ALLOWED_PATH_PREFIXES` 里 | `file.render.path` 只能是 `/opt/opspilot/apps/…` 等 |
+
+写白名单：
+
+```
+/opt/opspilot/apps/       /opt/opspilot/test/       /etc/systemd/system/
+/etc/supervisor/conf.d/   /etc/nginx/
+```
+
+区分两者是因为探一个已存在的数据目录是合法需求，而把写规则套在读路径上会让
+`mysql-precheck` 这类模板完全写不出来。
+
+## 载荷只走 stdin
+
+**argv 会被记录并持久化到 `result_json`，stdin 不会。** 所以文件内容、unit 正文、
+curl 配置里带 token 这类东西**必须**从 stdin 进：
+
+- `file.render` 用 `dd of=<tmp> status=none`，内容走 stdin。不用 `tee`：`tee` 会把内容
+  打进 stdout，而 `ActionResult.from_exec` 会把 stdout 写进摘要。
+- `systemd.render_unit` 先把正文 stage 到 `/opt/opspilot/test/`，再用受限的
+  `sudo install` 装进 `/etc/systemd/system/`。
+- `notification.telegram` 的 token 塞进 `curl --config -` 的 stdin，argv 里真的没有 token。
+  `shared/redaction.py` 另有 `/bot<digits>:<token>/` 的模式脱敏兜底。
+
+传输层只记 `stdin_bytes`（长度），不记内容。
+
+## 提权白名单
+
+`requires_sudo=True` 的动作一律走 `ensure_sudo_allowed(program)`，只放行：
+
+```
+/usr/bin/apt-get    /usr/sbin/useradd   /usr/sbin/usermod
+/usr/bin/systemctl  /usr/bin/supervisorctl   /usr/sbin/nginx
+/usr/bin/install
+```
+
+`chmod` / `chown` / `cp` / `mv` / `rm` / `dd` / `sh` / `bash` **刻意不在里面**。
+`install` 是唯一的 root 写原语，而且只用来把 SSH 用户已经 stage 好的文件搬过去。
+
+## `{{ server.* }}` 可读字段
+
+`SERVER_VALUE_KEYS`（18 个，来自 `ServerOut` / `FactsOut`）：
+
+```
+id  name  hostname  port  ssh_user  description  status
+os_name  os_version  kernel  arch
+cpu_count  cpu_model  memory_total_mb  memory_available_mb
+disk_total_gb  disk_available_gb
+```
+
+凭据字段（`ssh_password`、`credential`、`master_key`、`host_key_fingerprint` 等）**不在**里面，
+引用它们会直接拒绝整份模板。不是「渲染成空」，是拒绝。
+
+## 字面 `$` 的限制
+
+严格渲染器拒绝 `${...}`、`$(...)`、`` `...` `` 三种形态，所以 **V1 模板里写不出 shell 展开**。
+但 nginx 的 `$host` 是**允许**的：被拒绝的只是那三种形态，裸 `$name` 原样保留。
+
+代价是：需要 `${VAR}` 这种 shell 展开的配置文件，V1 模板渲染不出来。这类文件请直接把
+原文写进 `file.render` 的 `content`（不带 `${` 就行）。这是安全优先的取舍，不是遗漏。
+
+## `release_id` 保留字
+
+`app.fetch_release` / `app.install_release` 拒绝这些 `release_id`：
+
+```
+latest   current   shared   releases   ops
+```
+
+生产必须钉明确版本。「绝不自动跟随 `latest`」是硬要求，所以它在 action 里被拒，
+而不是只靠 inputs schema 的 `pattern` 约束 —— schema 是给 API 入参用的，
+action 才是最后一道闸。
+
+## 模板自带的测试
+
+每个模板的 `tests/` 不打任何远端主机，只证明两件事：
+
+- `test_<name>_validate.py` —— 合法：能加载、四层零错误、干跑干净、checksum 只覆盖
+  `template.yaml` + `schemas/*.json`（**不含** `tests/`）。
+- `test_<name>_idempotency.py` —— 可重跑：声明了哪些幂等类别、重跑产生同样的 argv、
+  配置是替换不是追加、载荷走 stdin。
+
+共用夹具在 `templates/harness.py`（`RecordingPort` / `run_steps`）。

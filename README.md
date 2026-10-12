@@ -3,9 +3,9 @@
 自托管的 Web 运维控制台：通过浏览器管理多台 Ubuntu / Debian Linux 服务器，做软件环境安装、
 Python 业务应用发布、服务管理、任务编排、健康检查、发布记录、失败恢复与审计。
 
-**当前阶段：S0 —— 工程初始化 / 迁移 / 认证 RBAC / 健康检查 / 前端壳。**
-S1（服务器资产）→ S2（任务引擎）→ S3（模板协议）→ S4（应用发布）按阶段交付，每个阶段收口时
-主分支始终可运行、可测试。
+**当前阶段：S3 —— 模板协议 / Action Registry / 模板校验与示例模板。**
+S0（工程初始化）→ S1（服务器资产）→ S2（任务引擎）已完成；S4（应用发布）待做。
+按阶段交付，每个阶段收口时主分支始终可运行、可测试。
 
 ---
 
@@ -177,14 +177,14 @@ cd frontend && npm install && npm run dev
 ## 测试
 
 ```bash
-# 后端 + shared（真 MySQL 集成测试，不用 SQLite 冒充）
+# 后端 + shared + 模板（真 MySQL 集成测试，不用 SQLite 冒充）
 . .venv/bin/activate
 export PYTHONPATH=$(pwd)
-pytest -q backend/tests shared/tests
+pytest backend/tests worker/tests shared/tests templates
 
 # 静态检查
 ruff check .
-mypy backend worker shared
+mypy backend worker shared templates
 
 # 前端
 cd frontend
@@ -198,8 +198,8 @@ npm run build
 mock 出绿色。`SKIP LOCKED`、utf8mb4 排序规则、`DATETIME(3)`、唯一约束行为在 SQLite 上都不等价，
 所以测试库必须是真 MySQL。
 
-**当前 S0 实测结果**（见下方「S0 收口记录」）：`pytest` 84 passed、`ruff` 通过、`mypy` 54 files
-通过、前端 lint/typecheck/7 tests/build 全部通过。
+**当前 S3 实测结果**（见下方「S3 收口记录」）：`pytest` 549 passed、`ruff` 通过、`mypy` 120 files
+通过、前端 lint/typecheck/build 全部通过。
 
 ---
 
@@ -290,7 +290,12 @@ journalctl -u opspilot-api -n 50 --no-pager
 - SSE 的 token 走查询参数（`EventSource` 设不了请求头）。该端点只读，且后端单独校验
   `task.read`。见 `docs/security-model.md`。
 - 取消只停后续步骤，**不回滚**。回滚是独立任务，S4 才有 `POST /deployments/{id}/rollback`。
-- 模板协议、应用发布尚未实现（S3–S4）。
+- 模板在 V1 里**不能出现字面 `$`**。严格渲染器拒绝 `${...}` / `$(...)` / 反引号，而 nginx
+  之类的配置又要写 `$host`。V1 选择安全优先：需要字面 `$` 的配置文件暂不能用模板渲染，
+  改用 `file.render` 的 `content` 原文（里面 `$host` 是允许的，因为被拒绝的只是 `${`、`$(`、
+  `` ` `` 三种形态）。见 `docs/template-protocol.md`。
+- 模板的 `release_id` 保留字 `latest` / `current` / `shared` / `releases` 一律拒绝，强制钉版本。
+- 应用发布链路尚未实现（S4）。
 - 前端有登录、外壳、健康状态、服务器、凭据、任务（列表 + 详情）六个页面；模板 / 应用 /
   发布记录 / 审计日志仍标注「即将开放」。
 
@@ -397,3 +402,68 @@ S2 新增的并发与恢复测试（都在真 MySQL 上跑）：
   `task.read`。若反代能透传 `Authorization`，应改成走头。
 - `server.check` 目前是唯一的任务类型。模板与发布（S3/S4）接入后才会出现多步骤计划。
 - 取消只停后续步骤，不回滚；回滚任务在 S4。
+
+---
+
+## S3 收口记录
+
+在 S2 之上新增：模板目录与加载器、15 个 V1 动作的 Action Registry、严格模式参数渲染、
+模板四层拒绝、版本生命周期与不可变发布、模板目录 API、5 个示例模板（各带校验与幂等测试）。
+
+**S3 的两条安全收口：**
+
+1. **载荷只走 stdin。** `ExecPort.run` 增加 `stdin`，文件内容、systemd unit、curl 配置里的
+   token 一律从 stdin 进，argv 里不出现。传输层只记 `stdin_bytes` 长度，绝不记内容。
+   `file.render` 用 `dd of=… status=none` 而不是 `tee`（`tee` 会把内容打进 stdout，
+   而 `ActionResult.from_exec` 会把 stdout 写进摘要）。Telegram token 走 `curl --config -`，
+   同时 `shared/redaction.py` 加了 `/bot<digits>:<token>/` 的模式脱敏兜底。
+2. **提权是白名单，不是约定。** `ensure_sudo_allowed` 只放行 `apt-get` / `useradd` / `usermod` /
+   `systemctl` / `supervisorctl` / `nginx` / `install`；`chmod` / `chown` / `cp` / `mv` / `rm` /
+   `dd` / `sh` / `bash` 刻意不在里面。
+
+**模板校验有四层拒绝**（`shared/templates.py`），任一层不过就整份模板拒绝，绝不「好的步骤先跑」：
+
+| 层 | 拒绝什么 |
+|---|---|
+| 1 结构 | YAML 不合 `TemplateSpec`、步骤 key 重复、`action` 未注册、name 与目录不一致 |
+| 2 绑定 | 参数名不在 action 的 `model_fields`、`{{ inputs.x }}` 未在 schema 声明、`{{ server.y }}` 不在 `SERVER_VALUE_KEYS` |
+| 3 渲染 | `{{ a \| b }}`、`{{ f(x) }}`、`{% %}`、`${}`、`$(())`、`` ` ``、不配对的 `{{` |
+| 4 干跑 | 用 schema 默认值渲染后交给 action 的 Pydantic 模型再验一次（服务白名单、路径白名单都在这层炸） |
+
+**读路径与写路径是两种规则。** `system.check_disk.path` 是读路径（`ReadPath`）：绝对、无
+`..`、无控制字符，但**不必**落在写前缀里 —— 探 `/var/lib/mysql` 是合法的。`file.render.path`
+是写路径（`RemotePath`），必须落在 `/opt/opspilot/apps/` 等白名单前缀里。模板校验按 action
+声明的字段类型分流，不按参数名猜。
+
+**版本生命周期：** `DRAFT → VALIDATED → TESTED → PUBLISHED → DEPRECATED`。一旦离开 `DRAFT`
+正文即冻结（`spec_json` / `inputs_schema_json` / `checksum` 不可改）；`PUBLISHED` 只能变
+`DEPRECATED`，没有 unpublish。有集成测试证明「已发布正文被拒绝改写后逐字节不变」。
+
+门禁命令与 S0 相同（`pytest` 路径加了 `templates`，`mypy` 加了 `templates`），真实结果：
+
+- `alembic upgrade head` 连跑两次 → 第二次无 `Running upgrade`
+- `pytest backend/tests worker/tests shared/tests templates` → **549 passed**（S2 时 262）
+- `ruff check .` → All checks passed
+- `mypy backend worker shared templates` → Success: no issues found in 120 source files
+- `find . -iname '*docker*' …` → 空
+
+S3 新增测试的分工：
+
+| 位置 | 数量 | 锁死了什么 |
+|---|---|---|
+| `shared/tests/test_actions.py` | 155 | 15 个动作的注入面、sudo 白名单、路径白名单、stdin 载荷边界、SSRF、token 不进 argv |
+| `shared/tests/test_templates.py` | 43 | 四层拒绝各自独立可测、checksum 确定性、生命周期表 |
+| `backend/tests/test_catalog_service.py` | 13 | 已发布正文不可变、非法状态迁移拒绝、`(template_id, version)` 唯一 |
+| `backend/tests/test_catalog_api.py` | 11 | 权限分离（viewer 读得到但发不了）、404/409 语义、发布被审计 |
+| `templates/*/tests/` | 65 | 每个示例模板的合法性 + 重跑收敛（各模板自己断言自己含哪些幂等类别） |
+
+**已知取舍（S3）：**
+
+- 每个模板的测试文件名是 `test_<name>_validate.py` / `test_<name>_idempotency.py`，不是
+  一律叫 `test_validate.py`。原因是模板名是 kebab-case（`nginx-site`），永远不可能组成
+  Python 包路径，pytest 收集五个同名 `test_validate.py` 会撞模块名。文件名带模板名后，
+  失败输出里一眼能看出是哪个模板。
+- `TESTED` 状态目前靠服务层 `transition(...)` 置位，HTTP 只暴露 `publish` / `deprecate`。
+  「跑过模板自带测试」在 V1 是操作员的判断，不是 CI 回写。
+- 模板里的 `secret_ref` 语法已在协议文档里定义，但 V1 的 5 个示例模板都没用到它 ——
+  真正接凭据解析在 S4 的发布链路里。

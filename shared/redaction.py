@@ -12,6 +12,7 @@ key looks sensitive.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -67,6 +68,11 @@ SENSITIVE_KEY_MARKERS: tuple[str, ...] = (
 
 #: Value-shaped markers. A string whose *value* starts with one of these is
 #: redacted even when its key looks harmless (e.g. inline PEM blobs).
+#: Telegram bot tokens: a numeric bot id, a colon, then a long opaque secret.
+#: They appear inside URLs rather than as a named field, so key-based
+#: redaction cannot see them — hence the value-shaped pattern below.
+_TELEGRAM_TOKEN_RE: re.Pattern[str] = re.compile(r"/bot\d{6,12}:[A-Za-z0-9_-]{20,}/")
+
 _SENSITIVE_VALUE_PREFIXES: tuple[str, ...] = (
     "-----BEGIN",
     "ssh-rsa ",
@@ -171,7 +177,9 @@ def redact_text(text: str) -> str:
     ):
         if marker in out:
             out = _mask_after(out, marker)
-    return out
+    # A Telegram bot token is not a `key=value` — it rides in a URL path
+    # (``/bot<token>/sendMessage``), which the marker scan above cannot see.
+    return _TELEGRAM_TOKEN_RE.sub(f"/bot{REDACTED}/", out)
 
 
 def _mask_after(text: str, marker: str) -> str:

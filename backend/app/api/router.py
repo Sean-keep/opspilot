@@ -12,6 +12,7 @@ from fastapi import APIRouter
 from backend.app.api import health
 from backend.app.audit.router import router as audit_router
 from backend.app.auth.router import router as auth_router
+from backend.app.catalog.router import router as catalog_router
 from backend.app.credentials.router import router as credentials_router
 from backend.app.inventory.router import router as inventory_router
 from backend.app.orchestrator.router import router as tasks_router
@@ -22,6 +23,7 @@ api_v1.include_router(auth_router)
 api_v1.include_router(audit_router)
 api_v1.include_router(inventory_router)
 api_v1.include_router(credentials_router)
+api_v1.include_router(catalog_router)
 api_v1.include_router(tasks_router)
 api_v1.include_router(task_runs_router)
 

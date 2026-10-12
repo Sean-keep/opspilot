@@ -30,6 +30,7 @@ from backend.app.auth.models import (
     User,
     UserRole,
 )
+from backend.app.catalog.models import Template, TemplateVersion
 from backend.app.credentials.models import Credential
 from backend.app.db.base import Base
 from backend.app.inventory.models import (
@@ -57,6 +58,8 @@ __all__ = [
     "TaskLog",
     "TaskRun",
     "TaskStep",
+    "Template",
+    "TemplateVersion",
     "User",
     "UserRole",
 ]

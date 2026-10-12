@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "nginx_site inputs",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["app_user", "app_root", "site_path"],
+  "properties": {
+    "app_user": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]{0,31}$",
+      "default": "opspilot-app",
+      "description": "System account that owns the document root."
+    },
+    "app_root": {
+      "type": "string",
+      "pattern": "^/opt/opspilot/apps/[a-z0-9][a-z0-9_-]{0,31}$",
+      "default": "/opt/opspilot/apps/demo",
+      "description": "Document root for the site."
+    },
+    "site_path": {
+      "type": "string",
+      "pattern": "^/etc/nginx/conf\\.d/[a-z0-9][a-z0-9_-]{0,31}\\.conf$",
+      "default": "/etc/nginx/conf.d/demo.conf",
+      "description": "Where the server block is written. Must stay under /etc/nginx/conf.d/."
+    },
+    "server_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9.-]{0,62}[a-z0-9])?$",
+      "default": "demo.example.internal",
+      "description": "Value of the nginx server_name directive."
+    },
+    "listen_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 80,
+      "description": "Port the server block listens on."
+    },
+    "upstream_host": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9.-]{0,62}[a-z0-9])?$",
+      "default": "127.0.0.1",
+      "description": "Host of the application behind nginx."
+    },
+    "upstream_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 8000,
+      "description": "Port of the application behind nginx."
+    },
+    "health_url": {
+      "type": "string",
+      "pattern": "^https?://[a-z0-9.-]+(:[0-9]{1,5})?/.*$",
+      "default": "http://demo.example.internal:8080/healthz",
+      "description": "URL the health check polls after the site is written."
+    }
+  }
+}

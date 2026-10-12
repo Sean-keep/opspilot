@@ -49,6 +49,18 @@ __all__ = [
 ]
 
 
+def _stdin_len(stdin: bytes | str | None) -> int | None:
+    """Byte count of the stdin payload, for the audit line.
+
+    A length, never the content: stdin is the channel for file contents and
+    tokens, and the whole point of routing them there is that they are not
+    written down.
+    """
+    if stdin is None:
+        return None
+    return len(stdin) if isinstance(stdin, (bytes, str)) else -1
+
+
 # --------------------------------------------------------------------------
 # Host key fingerprinting
 # --------------------------------------------------------------------------
@@ -176,7 +188,13 @@ class SshExecPort:
         self.default_timeout = default_timeout
 
     # ------------------------------------------------------------------
-    def run(self, ctx: ExecContext, argv: Sequence[str]) -> ExecResult:
+    def run(
+        self,
+        ctx: ExecContext,
+        argv: Sequence[str],
+        *,
+        stdin: bytes | str | None = None,
+    ) -> ExecResult:
         # Refuse before any socket is opened. Checking this only inside the
         # host-key policy would still allow a TCP connection (and a probe of the
         # network) on an untrusted host; the rule is "no pin, no connection".
@@ -187,14 +205,16 @@ class SshExecPort:
             )
 
         command = quote_argv(argv)
-        # Log the argv, never the resolved secret. ``command`` contains only
-        # caller-supplied argument text, which redaction already scrubs.
+        # Log the argv, never the resolved secret and never ``stdin``. argv is
+        # auditable on purpose; stdin exists precisely so payloads can stay out
+        # of the audit trail.
         log.info(
             "ssh.exec",
             host=ctx.host,
             port=ctx.port,
             user=ctx.user,
             argv=list(argv),
+            stdin_bytes=_stdin_len(stdin),
             fingerprint=ctx.host_key_fingerprint or "(unpinned)",
         )
 
@@ -231,8 +251,17 @@ class SshExecPort:
         try:
             # exec_command runs through the remote login shell; quote_argv has
             # already made each argument a single inert token.
-            stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-            stdin.close()
+            chan_stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+            try:
+                if stdin is not None:
+                    chan_stdin.write(stdin)
+                # Close the write half either way: a command reading stdin must
+                # see EOF rather than hang until the timeout.
+                chan_stdin.channel.shutdown_write()
+            except (paramiko.SSHException, OSError) as exc:
+                raise TransportError(f"could not send stdin to {ctx.host}: {exc}") from exc
+            finally:
+                chan_stdin.close()
             out = stdout.read().decode("utf-8", errors="replace")
             err = stderr.read().decode("utf-8", errors="replace")
             code = stdout.channel.recv_exit_status()

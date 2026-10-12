@@ -1,0 +1,54 @@
+api_version: v1
+name: supervisor-program
+version: 1.0.0
+description: >-
+  Declare a Supervisor program for a managed application and restart it. The
+  config is written atomically with a backup; the restart is the one
+  deliberately destructive step in this template and is what makes the new
+  config take effect.
+inputs_schema: schemas/inputs.schema.json
+
+steps:
+  - key: check_os
+    action: system.check_os
+    params:
+      expect: ["ubuntu-22.04", "ubuntu-24.04", "debian-12"]
+
+  - key: ensure_user
+    action: system.ensure_user
+    params:
+      username: "{{ inputs.app_user }}"
+      shell: /usr/sbin/nologin
+
+  - key: make_log_dir
+    action: file.render
+    params:
+      path: "{{ inputs.app_root }}/shared/logs"
+      kind: directory
+      mode: "0750"
+      owner: "{{ inputs.app_user }}"
+
+  - key: render_program
+    action: file.render
+    params:
+      path: "{{ inputs.program_path }}"
+      kind: file
+      mode: "0644"
+      owner: root
+      content: |
+        ; Managed by OpsPilot. Edit the template, not this file.
+        [program:{{ inputs.program_name }}]
+        command={{ inputs.app_root }}/current/venv/bin/python -m {{ inputs.module_name }}
+        directory={{ inputs.app_root }}/current
+        user={{ inputs.app_user }}
+        autostart=true
+        autorestart=true
+        stopasgroup=true
+        killasgroup=true
+        stdout_logfile={{ inputs.app_root }}/shared/logs/{{ inputs.program_name }}.out.log
+        stderr_logfile={{ inputs.app_root }}/shared/logs/{{ inputs.program_name }}.err.log
+
+  - key: restart_program
+    action: supervisor.restart
+    params:
+      program: "{{ inputs.program_name }}"

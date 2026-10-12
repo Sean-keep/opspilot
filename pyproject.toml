@@ -58,7 +58,7 @@ worker = ["py.typed"]
 # --------------------------------------------------------------------------
 [tool.pytest.ini_options]
 minversion = "8.0"
-testpaths = ["backend/tests", "worker/tests", "shared/tests"]
+testpaths = ["backend/tests", "worker/tests", "shared/tests", "templates"]
 addopts = "-q --strict-markers --strict-config"
 markers = [
   "integration: needs a reachable MySQL (opspilot_test); skipped when unavailable",
