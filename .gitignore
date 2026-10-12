@@ -1,0 +1,42 @@
+# --- secrets / local config ---------------------------------------------
+# Real secrets never enter the repository. Only .env.example is committed.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!docs/**/*.key.example
+/secrets/
+
+# --- python -------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- node ---------------------------------------------------------------
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# --- editors / os -------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- logs / runtime -----------------------------------------------------
+*.log
+/var/
+/run/

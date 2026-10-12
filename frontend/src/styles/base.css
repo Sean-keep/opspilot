@@ -1,0 +1,26 @@
+/* Minimal global styles. Component styling lives next to each component. */
+:root {
+  --opspilot-bg: #f5f7fa;
+  --opspilot-sidebar: #1f2d3d;
+  --opspilot-sidebar-text: #c0c8d2;
+  --opspilot-sidebar-active: #ffffff;
+  --opspilot-border: #e4e7ed;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--opspilot-bg);
+  color: #303133;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    'Noto Sans SC', sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}

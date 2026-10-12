@@ -1,0 +1,47 @@
+[Unit]
+Description=OpsPilot Worker (task executor)
+Documentation=file:///opt/opspilot/README.md
+After=network-online.target mysql.service opspilot-api.service
+Wants=network-online.target
+Requires=mysql.service
+
+[Service]
+Type=exec
+User=opspilot
+Group=opspilot
+WorkingDirectory=/opt/opspilot
+EnvironmentFile=-/etc/opspilot/opspilot.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/opspilot/.venv/bin/python -m worker.main
+Restart=on-failure
+RestartSec=5s
+
+# The worker must shut down cleanly so an in-flight run can release its lease
+# rather than waiting for it to expire.
+TimeoutStopSec=60s
+KillSignal=SIGTERM
+KillMode=mixed
+
+# Hardening. The worker talks to MySQL and out over SSH; it needs no more than
+# that. Remote commands are argv-separated and never a local shell.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+
+ReadWritePaths=/var/log/opspilot
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

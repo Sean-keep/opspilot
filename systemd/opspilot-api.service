@@ -1,0 +1,47 @@
+[Unit]
+Description=OpsPilot API (FastAPI control plane)
+Documentation=file:///opt/opspilot/README.md
+After=network-online.target mysql.service
+Wants=network-online.target
+Requires=mysql.service
+
+[Service]
+Type=exec
+User=opspilot
+Group=opspilot
+WorkingDirectory=/opt/opspilot
+EnvironmentFile=-/etc/opspilot/opspilot.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/opspilot/.venv/bin/python -m uvicorn backend.app.main:app --host ${OPSPILOT_API_HOST} --port ${OPSPILOT_API_PORT}
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+# Hardening. The API never needs root, never writes outside its own tree, and
+# must not be able to load a kernel module or change the system clock.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+
+# Writable paths. Logs go to the journal; no other writes are required.
+ReadWritePaths=/var/log/opspilot
+UMask=0077
+
+# Failure signalling
+KillSignal=SIGTERM
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
