@@ -116,10 +116,140 @@ export interface HostKeyDiscoverOut {
   state: HostKeyState
 }
 
-export interface ServerCheckResult {
-  ok: boolean
-  detail: string
-  facts: FactsOut | null
+// ---------------------------------------------------------------------------
+// S2: tasks
+// ---------------------------------------------------------------------------
+
+/**
+ * Task lifecycle. Terminal states are `SUCCESS`, `PARTIAL_SUCCESS`, `FAILED`
+ * and `CANCELLED`; `SUCCESS` is hard-terminal and cannot move again.
+ */
+export type TaskStatus =
+  | 'PENDING'
+  | 'QUEUED'
+  | 'RUNNING'
+  | 'SUCCESS'
+  | 'PARTIAL_SUCCESS'
+  | 'FAILED'
+  | 'CANCELLING'
+  | 'CANCELLED'
+
+/** Per-server outcome. `UNKNOWN` is human-resolved and never auto-retried. */
+export type RunStatus =
+  | 'WAITING'
+  | 'PRECHECK'
+  | 'EXECUTING'
+  | 'VERIFYING'
+  | 'SUCCESS'
+  | 'FAILED'
+  | 'CANCELLING'
+  | 'CANCELLED'
+  | 'UNKNOWN'
+
+export type StepStatus =
+  | 'PENDING'
+  | 'RUNNING'
+  | 'SUCCESS'
+  | 'FAILED'
+  | 'SKIPPED'
+  | 'CANCELLED'
+  | 'UNKNOWN'
+
+export type IdempotencyClass = 'SAFE' | 'CONDITIONAL' | 'DESTRUCTIVE'
+
+export interface TaskStepOut {
+  id: number
+  step_key: string
+  attempt: number
+  action: string
+  status: StepStatus
+  idempotency_class: IdempotencyClass
+  started_at: string | null
+  finished_at: string | null
+  exit_code: number | null
+  duration_ms: number | null
+  result: Record<string, unknown> | null
+}
+
+export interface TaskRunOut {
+  id: number
+  task_id: number
+  server_id: number
+  status: RunStatus
+  attempt: number
+  lease_owner: string
+  lease_expires_at: string | null
+  heartbeat_at: string | null
+  started_at: string | null
+  finished_at: string | null
+  error_detail: string
+  recovery_note: string
+  steps: TaskStepOut[]
+}
+
+export interface TaskOut {
+  id: number
+  kind: string
+  title: string
+  status: TaskStatus
+  idempotency_key: string
+  requested_by: number | null
+  requested_by_name: string
+  queued_at: string | null
+  started_at: string | null
+  finished_at: string | null
+  cancel_requested_at: string | null
+  retry_of_task_id: number | null
+  created_at: string
+  updated_at: string
+}
+
+export interface TaskDetailOut extends TaskOut {
+  runs: TaskRunOut[]
+}
+
+export interface TaskLogOut {
+  id: number
+  run_id: number
+  step_id: number | null
+  seq: number
+  ts: string
+  level: string
+  stream: string
+  message: string
+}
+
+export interface TaskLogPage {
+  items: TaskLogOut[]
+  next_seq: number
+  total: number
+}
+
+export interface TaskCancelBody {
+  reason?: string
+  /** Required: the backend refuses a cancel without it. */
+  confirm: true
+}
+
+export interface TaskRetryBody {
+  reason?: string
+  run_ids?: number[]
+}
+
+export type RunVerdict = 'success' | 'retry' | 'failure'
+
+export interface RunResolveBody {
+  verdict: RunVerdict
+  reason: string
+}
+
+export interface RunResolveOut {
+  id: number
+  task_id: number
+  server_id: number
+  status: RunStatus
+  attempt: number
+  recovery_note: string
 }
 
 // ---------------------------------------------------------------------------

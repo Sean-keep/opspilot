@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response, status
 
 from backend.app.auth.deps import DbSession, require_permission
 from backend.app.auth.models import User
@@ -17,12 +17,13 @@ from backend.app.inventory.schemas import (
     FactsOut,
     HostKeyAcceptRequest,
     HostKeyDiscoverOut,
-    ServerCheckResult,
     ServerCreate,
     ServerOut,
     ServerUpdate,
 )
 from backend.app.inventory.service import InventoryService
+from backend.app.orchestrator.schemas import TaskOut
+from backend.app.orchestrator.service import TaskService
 
 router = APIRouter(prefix="/servers", tags=["inventory"])
 
@@ -37,7 +38,12 @@ def _service(db: DbSession) -> InventoryService:
     return InventoryService(db)
 
 
+def _tasks(db: DbSession) -> TaskService:
+    return TaskService(db)
+
+
 ServiceDep = Annotated[InventoryService, Depends(_service)]
+TaskServiceDep = Annotated[TaskService, Depends(_tasks)]
 
 
 @router.get("", response_model=list[ServerOut])
@@ -116,21 +122,43 @@ def accept_host_key(
 
 
 # --------------------------------------------------------------------------
-# Connectivity + environment check
+# Environment check — enqueue only; the Worker runs it
 # --------------------------------------------------------------------------
-@router.post("/{server_id}/check", response_model=ServerCheckResult)
+@router.post(
+    "/{server_id}/check",
+    response_model=TaskOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 def check_server(
     server_id: int,
+    response: Response,
     user: CanCheckServer,
     service: ServiceDep,
-) -> ServerCheckResult:
-    """Run the read-only system check and store a facts snapshot.
+    tasks: TaskServiceDep,
+) -> TaskOut:
+    """Queue the read-only system check and return the task that will run it.
 
-    A reachable-but-unhealthy host returns ``ok: false`` with a detail message —
-    that is a result, not an error. An untrusted host key refuses to run.
+    This is the S1 -> S2 seam. The API used to SSH to the host and answer
+    immediately; it no longer decrypts credentials or opens a session. It
+    validates that the check is *allowed* — the host key is verified and a
+    usable credential is bound — then hands the work to the Worker.
+
+    The response is ``202 Accepted`` because the check has not happened yet.
+    Follow ``Location`` for status, or watch
+    ``GET /api/v1/tasks/{id}/events`` for live logs; the facts land in
+    ``GET /api/v1/servers/{id}/facts`` once the run finishes.
     """
-    _row, result = service.run_check(server_id, actor_id=user.id)
-    return result
+    row = service.require_checkable(server_id)
+    task, _created = tasks.create(
+        kind="server.check",
+        title=f"check {row.name}",
+        params={"server_id": row.id, "server_name": row.name},
+        server_ids=[row.id],
+        actor_id=user.id,
+        actor_name=user.username,
+    )
+    response.headers["Location"] = f"/api/v1/tasks/{task.id}"
+    return TaskOut(**tasks.to_out(task))
 
 
 @router.get("/{server_id}/facts", response_model=list[FactsOut])

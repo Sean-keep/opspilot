@@ -19,8 +19,8 @@ import sys
 import time
 import uuid
 
-from backend.app.core.logging import configure_logging, get_logger
-from backend.app.core.settings import Settings, get_settings
+from shared.config import Settings, get_settings
+from shared.logsetup import configure_logging, get_logger
 
 from worker.scheduler import Scheduler
 

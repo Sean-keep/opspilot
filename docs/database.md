@@ -43,10 +43,20 @@ URL 里也带了 `init_command` 做同样的事 —— 三层兜底，因为时�
 `ops_servers.host_key_fingerprint` 是信任锚。地址或端口变更会把该列清空并回到
 `unverified` —— 新端点就是新主机，旧 pin 不再适用。
 
-### S2
+### S2 已落地（迁移 `0003`）
 
-`ops_tasks`、`ops_task_runs`、`ops_task_steps`、`ops_task_logs`、`ops_outbox`、
-`ops_api_idempotency`
+| 表 | 用途 |
+|---|---|
+| `ops_tasks` | 任务。`idempotency_key` 唯一；`target_snapshot_json` 在提交时刻冻结目标服务器集合 |
+| `ops_task_runs` | 任务 × 服务器 = 一个 Run。持有 `lease_owner` / `lease_expires_at` / `heartbeat_at` |
+| `ops_task_steps` | 步骤执行记录。唯一 `(run_id, step_key, attempt)`；`result_json` 含取消证据 |
+| `ops_task_logs` | 追加式日志。`(run_id, seq)` 是游标；API 出口再脱敏一次 |
+| `ops_outbox` | 与任务同事务写入的「已入队」凭据，杜绝「DB 提交了但没人入队」 |
+| `ops_api_idempotency` | 请求层幂等回放。`(scope, idempotency_key)` + `request_hash` |
+| `ops_lease_recoveries` | 租约过期恢复的判定留痕（探活结果、最终 decision） |
+
+`ops_lease_recoveries` 记录恢复器每一次裁决，因为「为什么这个 Run 变成了 `UNKNOWN`」
+事后必须能答得出来，而不是靠猜。
 
 ### S3
 
@@ -67,6 +77,8 @@ URL 里也带了 `init_command` 做同样的事 —— 三层兜底，因为时�
 | `ops_task_steps` UNIQUE `(run_id, step_key, attempt)` | 同一步骤同一次尝试只有一条记录 |
 | `ops_api_idempotency` UNIQUE `(scope, idempotency_key)` + `request_hash` | 同 key 同 body 回放原响应；同 key 不同 body → 409 |
 | `ops_permissions.code` UNIQUE | 权限码是稳定词汇表 |
+
+S2 的三条任务约束各有集成测试直接撞库断言 `IntegrityError`，不是「应该有」的注释。
 
 ## 迁移策略
 

@@ -14,10 +14,9 @@ from pathlib import Path
 
 import paramiko
 import pytest
-
-from backend.app.executor.keys import staged_private_key
-from backend.app.executor.port import ExecContext, HostKeyError, NotVerifiedError
-from backend.app.executor.ssh import (
+from shared.executor.keys import staged_private_key
+from shared.executor.port import ExecContext, HostKeyError, NotVerifiedError
+from shared.executor.ssh import (
     SshExecPort,
     _PinnedHostKeyPolicy,
     quote_argv,
@@ -144,7 +143,7 @@ def test_no_autopolicy_is_ever_instantiated() -> None:
     """
     import ast
 
-    root = Path(__file__).resolve().parents[1] / "app" / "executor"
+    root = Path(__file__).resolve().parents[2] / "shared" / "executor"
     offenders: list[str] = []
     for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

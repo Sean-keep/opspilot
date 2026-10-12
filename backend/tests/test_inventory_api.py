@@ -1,85 +1,26 @@
-"""Inventory API: CRUD, RBAC, host-key trust, and the check refusal path.
+"""Inventory API: CRUD, RBAC, host-key trust, and the check preconditions.
 
-The live SSH transport is exercised separately (``test_ssh_live.py``). Here the
-transport is a fake so the tests can assert what the *platform* does: refuse
-untrusted hosts, never echo secrets, and enforce permissions on the backend.
+The live SSH transport is exercised separately (``test_ssh_live.py``) and the
+end-to-end check path is ``test_check_via_worker.py``. Here the tests assert
+what the *platform* does: refuse untrusted hosts, never echo secrets, and
+enforce permissions on the backend.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from backend.app.executor.port import ExecContext, ExecResult
 from backend.app.inventory.models import (
-    CHECK_OK,
     HOSTKEY_PENDING_CONFIRM,
     HOSTKEY_UNVERIFIED,
     HOSTKEY_VERIFIED,
     SERVER_DELETED,
     Server,
 )
-
-# --------------------------------------------------------------------------
-# Fakes
-# --------------------------------------------------------------------------
-
-
-class FakeExecPort:
-    """Records argv lists and returns canned output. Never opens a socket."""
-
-    def __init__(
-        self,
-        outputs: dict[str, str] | None = None,
-        *,
-        exit_code: int = 0,
-    ) -> None:
-        self.calls: list[tuple[ExecContext, list[str]]] = []
-        self.outputs = outputs or {}
-        self.exit_code = exit_code
-
-    def run(self, ctx: ExecContext, argv: Sequence[str]) -> ExecResult:
-        argv_list = list(argv)
-        self.calls.append((ctx, argv_list))
-        key = " ".join(argv_list[:2])
-        return ExecResult(
-            exit_code=self.exit_code,
-            stdout=self.outputs.get(key, self.outputs.get(argv_list[0], "")),
-            stderr="",
-            argv=tuple(argv_list),
-        )
-
-
-OS_RELEASE = 'NAME="Ubuntu"\nVERSION_ID="24.04"\nID=ubuntu\n'
-UNAME = "Linux 6.8.0-45-generic x86_64\n"
-NPROC = "4\n"
-MEMINFO = "MemTotal:       16326224 kB\nMemAvailable:    8123456 kB\n"
-CPUINFO = "model name\t: Intel(R) Core(TM) i5-10400 CPU @ 2.90GHz\n"
-DF = (
-    "Filesystem     1024-blocks      Used Available Capacity Mounted on\n"
-    "/dev/sda1      10737418240 536870912 10200547328       5% /\n"
-)
-
-
-def outputs_for_facts() -> dict[str, str]:
-    """Canned remote output, keyed by the first two argv tokens.
-
-    The check action always issues the same fixed argv lists (see
-    ``backend/app/inventory/checks.py``), so those keys are unambiguous.
-    """
-    return {
-        "cat /etc/os-release": OS_RELEASE,
-        "uname -srm": UNAME,
-        "nproc": NPROC,
-        "cat /proc/meminfo": MEMINFO,
-        "grep -m1": CPUINFO,
-        "df -P": DF,
-    }
-
 
 FAKE_FINGERPRINT = "SHA256:" + "B" * 43
 FAKE_ALGORITHM = "ssh-ed25519"
@@ -255,15 +196,16 @@ def test_check_refuses_when_host_key_never_discovered(
     credential_id: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake = FakeExecPort(outputs_for_facts())
-    monkeypatch.setattr("backend.app.inventory.service.SshExecPort", lambda **_kw: fake)
-
+    _patch_trust_flow(monkeypatch)
     body = _create_server(client, admin_headers, credential_id=credential_id)
     resp = client.post(f"/api/v1/servers/{body['id']}/check", headers=admin_headers)
 
     assert resp.status_code == 409
     assert resp.json()["code"] == "host_key_not_verified"
-    assert fake.calls == [], "no command may run on an untrusted host"
+    # Refused before any work was queued — an untrusted host gets no task.
+    tasks = client.get("/api/v1/tasks", headers=admin_headers)
+    assert tasks.status_code == 200
+    assert [t for t in tasks.json() if t["kind"] == "server.check"] == []
 
 
 def test_discover_then_accept_pins_the_fingerprint(
@@ -355,56 +297,54 @@ def test_changing_hostname_drops_the_pin(
 
 
 # --------------------------------------------------------------------------
-# Check
+# Check — the API enqueues; the Worker runs (the S1 -> S2 seam)
+#
+# The end-to-end path (facts land, failure is a result, no secret anywhere)
+# lives in ``test_check_via_worker.py``. What is asserted here is that the API
+# side of the seam does its part and nothing more.
 # --------------------------------------------------------------------------
-def test_check_collects_facts_and_stores_a_snapshot(
+def _trust(
+    client: TestClient,
+    headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    body: dict[str, Any],
+) -> None:
+    _patch_trust_flow(monkeypatch)
+    client.post(f"/api/v1/servers/{body['id']}/discover-hostkey", headers=headers)
+    client.post(
+        f"/api/v1/servers/{body['id']}/accept-hostkey",
+        headers=headers,
+        json={"fingerprint": FAKE_FINGERPRINT},
+    )
+
+
+def test_check_enqueues_a_task_instead_of_running_it(
     client: TestClient,
     admin_headers: dict[str, str],
     credential_id: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_trust_flow(monkeypatch)
-    fake = FakeExecPort(outputs_for_facts())
-    monkeypatch.setattr("backend.app.inventory.service.SshExecPort", lambda **_kw: fake)
-
+    """``202 Accepted``: the check has been queued, not performed."""
     body = _create_server(client, admin_headers, credential_id=credential_id)
-    client.post(f"/api/v1/servers/{body['id']}/discover-hostkey", headers=admin_headers)
-    client.post(
-        f"/api/v1/servers/{body['id']}/accept-hostkey",
-        headers=admin_headers,
-        json={"fingerprint": FAKE_FINGERPRINT},
-    )
+    _trust(client, admin_headers, monkeypatch, body)
 
     resp = client.post(f"/api/v1/servers/{body['id']}/check", headers=admin_headers)
-    assert resp.status_code == 200, resp.text
-    result = resp.json()
-    assert result["ok"] is True
-    facts = result["facts"]
-    assert facts["os_name"] == "ubuntu"
-    assert facts["os_version"] == "24.04"
-    assert facts["arch"] == "x86_64"
-    assert facts["cpu_count"] == 4
-    assert "i5-10400" in facts["cpu_model"]
-    assert facts["memory_total_mb"] == 15943  # 16326224 kB // 1024
-    assert facts["disk_total_gb"] > 0
+    assert resp.status_code == 202, resp.text
+    task = resp.json()
+    assert task["kind"] == "server.check"
+    assert task["status"] == "QUEUED"
+    assert resp.headers["location"] == f"/api/v1/tasks/{task['id']}"
 
-    # Every remote command was argv-separated, not a shell line.
-    for _ctx, argv in fake.calls:
-        assert isinstance(argv, list)
-        assert all(isinstance(a, str) for a in argv)
-        assert not any(x in argv for x in ("sh", "bash", "sudo"))
-        # The cpu model lookup must not go through a shell.
-        if argv and argv[0] == "grep":
-            assert argv[1] == "-m1"
-
-    # The snapshot is persisted and visible on the server.
+    # Nothing has run yet: no facts, and the server still reads as unchecked.
     listed = client.get(f"/api/v1/servers/{body['id']}", headers=admin_headers)
-    assert listed.json()["last_check_status"] == CHECK_OK
-    assert listed.json()["latest_facts"]["os_name"] == "ubuntu"
+    assert listed.json()["last_check_status"] == "unknown"
+    assert listed.json()["latest_facts"] is None
 
-    history = client.get(f"/api/v1/servers/{body['id']}/facts", headers=admin_headers)
-    assert history.status_code == 200
-    assert len(history.json()) == 1
+    runs = client.get(f"/api/v1/tasks/{task['id']}/runs", headers=admin_headers)
+    assert runs.status_code == 200, runs.text
+    assert len(runs.json()) == 1
+    assert runs.json()[0]["status"] == "WAITING"
+    assert runs.json()[0]["server_id"] == body["id"]
 
 
 def test_check_refuses_when_credential_missing(
@@ -412,58 +352,16 @@ def test_check_refuses_when_credential_missing(
     admin_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_trust_flow(monkeypatch)
-    fake = FakeExecPort(outputs_for_facts())
-    monkeypatch.setattr("backend.app.inventory.service.SshExecPort", lambda **_kw: fake)
-
     body = _create_server(client, admin_headers)  # no credential
-    client.post(f"/api/v1/servers/{body['id']}/discover-hostkey", headers=admin_headers)
-    client.post(
-        f"/api/v1/servers/{body['id']}/accept-hostkey",
-        headers=admin_headers,
-        json={"fingerprint": FAKE_FINGERPRINT},
-    )
+    _trust(client, admin_headers, monkeypatch, body)
 
     resp = client.post(f"/api/v1/servers/{body['id']}/check", headers=admin_headers)
     assert resp.status_code == 422
     assert "credential" in resp.json()["message"]
-    assert fake.calls == []
 
-
-def test_check_failure_is_a_result_not_an_http_error(
-    client: TestClient,
-    admin_headers: dict[str, str],
-    credential_id: int,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A host that is down is an answer the operator asked for."""
-    from backend.app.executor.port import TransportError
-
-    _patch_trust_flow(monkeypatch)
-
-    class FailingPort(FakeExecPort):
-        def run(self, ctx: ExecContext, argv: Sequence[str]) -> ExecResult:
-            raise TransportError("connection refused")
-
-    fake = FailingPort()
-    monkeypatch.setattr("backend.app.inventory.service.SshExecPort", lambda **_kw: fake)
-
-    body = _create_server(client, admin_headers, credential_id=credential_id)
-    client.post(f"/api/v1/servers/{body['id']}/discover-hostkey", headers=admin_headers)
-    client.post(
-        f"/api/v1/servers/{body['id']}/accept-hostkey",
-        headers=admin_headers,
-        json={"fingerprint": FAKE_FINGERPRINT},
-    )
-
-    resp = client.post(f"/api/v1/servers/{body['id']}/check", headers=admin_headers)
-    assert resp.status_code == 200
-    assert resp.json()["ok"] is False
-    assert "connection refused" in resp.json()["detail"]
-    assert resp.json()["facts"] is None
-
-    listed = client.get(f"/api/v1/servers/{body['id']}", headers=admin_headers)
-    assert listed.json()["last_check_status"] == "failed"
+    # A refused check must not leave work behind for the Worker to trip over.
+    tasks = client.get("/api/v1/tasks", headers=admin_headers)
+    assert [t for t in tasks.json() if t["kind"] == "server.check"] == []
 
 
 def test_check_never_leaks_the_private_key(
@@ -482,30 +380,35 @@ def test_check_never_leaks_the_private_key(
     )
     marked_id = int(resp.json()["id"])
 
-    _patch_trust_flow(monkeypatch)
-    fake = FakeExecPort(outputs_for_facts())
-    monkeypatch.setattr("backend.app.inventory.service.SshExecPort", lambda **_kw: fake)
-
     body = _create_server(
         client, admin_headers, name="marked-host", credential_id=marked_id
     )
-    client.post(f"/api/v1/servers/{body['id']}/discover-hostkey", headers=admin_headers)
-    client.post(
-        f"/api/v1/servers/{body['id']}/accept-hostkey",
-        headers=admin_headers,
-        json={"fingerprint": FAKE_FINGERPRINT},
-    )
-    check = client.post(f"/api/v1/servers/{body['id']}/check", headers=admin_headers)
-    assert check.status_code == 200, check.text
+    _trust(client, admin_headers, monkeypatch, body)
 
+    check = client.post(f"/api/v1/servers/{body['id']}/check", headers=admin_headers)
+    assert check.status_code == 202, check.text
     assert secret_marker not in check.text
+
+    task_id = check.json()["id"]
+    runs = client.get(f"/api/v1/tasks/{task_id}/runs", headers=admin_headers)
+    assert runs.status_code == 200
+    run_id = runs.json()[0]["id"]
+
+    for url in (
+        f"/api/v1/tasks/{task_id}",
+        f"/api/v1/tasks/{task_id}/runs",
+        f"/api/v1/task-runs/{run_id}/logs",
+        f"/api/v1/servers/{body['id']}",
+    ):
+        got = client.get(url, headers=admin_headers)
+        assert secret_marker not in got.text, url
 
     # Not in the credential view either.
     view = client.get(f"/api/v1/credentials/{marked_id}", headers=admin_headers)
     assert secret_marker not in view.text
     assert "payload_encrypted" not in view.text
 
-    # And not in anything the transport was asked to log.
+    # And not in anything the request path logged.
     _out, err = capsys.readouterr()
     assert secret_marker not in err
     assert secret_marker not in _out

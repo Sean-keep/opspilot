@@ -10,9 +10,9 @@ import type {
   CredentialOut,
   FactsOut,
   HostKeyDiscoverOut,
-  ServerCheckResult,
   ServerCreateBody,
   ServerOut,
+  TaskOut,
 } from '@/types/api'
 
 // ---------------------------------------------------------------------------
@@ -50,9 +50,13 @@ export function acceptHostKey(id: number, fingerprint: string): Promise<ServerOu
   return api.post<ServerOut>(`/api/v1/servers/${id}/accept-hostkey`, { fingerprint })
 }
 
-/** Read-only connectivity + environment check. Stores a facts snapshot. */
-export function checkServer(id: number): Promise<ServerCheckResult> {
-  return api.post<ServerCheckResult>(`/api/v1/servers/${id}/check`)
+/**
+ * Queue the read-only environment check and get back the task that will run
+ * it. The API does not SSH anywhere: the Worker does, and the facts land on
+ * the server record once the run finishes.
+ */
+export function checkServer(id: number): Promise<TaskOut> {
+  return api.post<TaskOut>(`/api/v1/servers/${id}/check`)
 }
 
 export function listFacts(id: number, limit = 50): Promise<FactsOut[]> {

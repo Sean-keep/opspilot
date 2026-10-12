@@ -10,7 +10,10 @@
 PENDING ──► QUEUED ──► RUNNING ──┬──► SUCCESS
                                  ├──► PARTIAL_SUCCESS
                                  ├──► FAILED
-                                 └──► CANCELLING ──► CANCELLED
+                                 └──► CANCELLING ──┬──► CANCELLED
+                                                   ├──► SUCCESS
+                                                   ├──► PARTIAL_SUCCESS
+                                                   └──► FAILED
 ```
 
 | 状态 | 含义 |
@@ -18,11 +21,20 @@ PENDING ──► QUEUED ──► RUNNING ──┬──► SUCCESS
 | `PENDING` | 已写入，尚未入队（同一事务里也会写 `ops_outbox`） |
 | `QUEUED` | 已入队，等待 Worker 认领 |
 | `RUNNING` | 至少一个 Run 在执行 |
-| `SUCCESS` | 所有目标 Run 成功 |
+| `SUCCESS` | 所有目标 Run 成功。**硬终态，永不再动** |
 | `PARTIAL_SUCCESS` | 有成功也有失败/取消的终态 |
 | `FAILED` | 无成功，且有失败 |
 | `CANCELLING` | 用户已请求取消，正在停 |
 | `CANCELLED` | 取消完成 |
+
+`PENDING` / `QUEUED` 也能直接进 `FAILED`（例如目标服务器在入队后被删掉，一个 Run 都跑不了）。
+
+**取消是协作式的。** `CANCELLING` 允许继续走到 `SUCCESS` / `PARTIAL_SUCCESS` / `FAILED`：
+停的信号发出去了，但已经在跑的步骤可能先一步跑完，任务就该按真实结果收尾，而不是被
+`CANCELLED` 盖掉。
+
+**重试边（`PARTIAL_SUCCESS` / `FAILED` / `CANCELLED` → `QUEUED`）只由 `POST /tasks/{id}/retry`
+触发**，Worker 不会自己走过去。`SUCCESS` 没有出边 —— 成功了就结束了，要再做一遍就新建任务。
 
 **聚合规则：**
 
@@ -31,17 +43,39 @@ PENDING ──► QUEUED ──► RUNNING ──┬──► SUCCESS
 有 SUCCESS 也有其它终态    → PARTIAL_SUCCESS
 无 SUCCESS 且有 FAILED     → FAILED
 用户取消主导               → CANCELLED
+还有 CANCELLED / UNKNOWN 混着 → PARTIAL_SUCCESS   （必须有人看一眼）
 ```
+
+### 折叠可以跳过没人观察到的状态
+
+折叠是从 Run 的终态推任务的终态。任务可能停在 `QUEUED` 而所有 Run 已经走到 `SUCCESS`
+（Worker 折 Run，Scheduler 折任务，两个进程）。此时合法路径是 `QUEUED → RUNNING → SUCCESS`，
+但 `RUNNING` 没人写过。
+
+于是折叠走的是 `task_route(current, target)`：一张 BFS，只允许**非终态**当跳板，按
+`RUNNING → CANCELLING → QUEUED → PENDING` 的顺序试探，找到路就把沿途状态逐个写一遍
+（`started_at` 就在这时补上）。
+
+跳板只对非终态开放，所以 `FAILED → … → SUCCESS` 仍然是不可能的。终态到终态只有
+`allow_terminal_repivot` 一条路，而它只在人工 resolve 时使用。
 
 ## Run（`ops_task_runs.status`）
 
 一个 Run 是「一个任务在一台服务器上的一次执行」。
 
 ```
-WAITING ──► PRECHECK ──► EXECUTING ──► VERIFYING ──┬──► SUCCESS
-                                                  └──► FAILED
-任意执行态 ──► CANCELLING ──► CANCELLED
-任意执行态 ──► UNKNOWN   （租约过期且无法判定远端结果）
+WAITING ──► PRECHECK ──┬──► EXECUTING ──► VERIFYING ──┬──► SUCCESS
+                       │                              └──► FAILED
+                       ├──► VERIFYING
+                       ├──► SUCCESS          （预检本身就是工作内容）
+                       ├──► FAILED
+                       ├──► CANCELLED        （没跑过，不必表演 CANCELLING）
+                       └──► UNKNOWN
+
+PRECHECK / EXECUTING / VERIFYING ──┬──► SUCCESS / FAILED / UNKNOWN / WAITING
+                                   └──► CANCELLING ──► CANCELLED
+
+FAILED / CANCELLED / UNKNOWN ──► WAITING   （人工重试 / 人工裁定，attempt+1）
 ```
 
 | 状态 | 含义 |
@@ -50,9 +84,19 @@ WAITING ──► PRECHECK ──► EXECUTING ──► VERIFYING ──┬─�
 | `PRECHECK` | 已认领，正在做只读预检（磁盘、OS、依赖） |
 | `EXECUTING` | 正在跑步骤 |
 | `VERIFYING` | 步骤跑完，正在做健康检查 |
-| `SUCCESS` / `FAILED` | 终态 |
+| `SUCCESS` | 终态 |
+| `FAILED` | 终态（可人工重试） |
 | `CANCELLING` / `CANCELLED` | 取消中 / 已取消 |
 | `UNKNOWN` | **远端状态无法判定** —— 见下 |
+
+三条刻意不那么直观的边：
+
+- **`WAITING → CANCELLED`**：还没开始的 Run 直接取消。此时没有在飞的工作要收，
+  走一遍 `CANCELLING` 只是表演。
+- **`PRECHECK → SUCCESS`**：有些 Run 的预检本身就是全部工作（`server.check` 就是）。
+- **活动状态 `→ WAITING`**：租约过期但**还没有结论**的 Run 退回队列是安全的 ——
+  它没有宣称过任何结果。有结论的状态（`FAILED` / `CANCELLED` / `UNKNOWN`）回到
+  `WAITING` 只能由人推动。
 
 ### `UNKNOWN` 不是失败
 
@@ -65,8 +109,16 @@ WAITING ──► PRECHECK ──► EXECUTING ──► VERIFYING ──┬─�
    - 步骤是**非幂等**的（`mysql.precheck` 之后的初始化、数据迁移）→ 标 **`UNKNOWN`**，挂人工核查
 4. **无法判断远端状态**（SSH 连不上）→ **`UNKNOWN`**。
 
-`UNKNOWN` 是一个**需要人工裁决的分支**，不是可自动重试的失败。它只能由人
-`POST /task-runs/{id}/resolve` 明确「确认失败→重试」或「确认成功→改判」。
+`UNKNOWN` 是一个**需要人工裁决的分支**，不是可自动重试的失败。`POST /tasks/{id}/retry`
+会**跳过**它。离开 `UNKNOWN` 的唯一入口是 `POST /task-runs/{id}/resolve`，一次只裁一个
+Run，必须给出理由，三种裁定：
+
+| 裁定 | 含义 | 去向 |
+|---|---|---|
+| `success` | 实际成功了 | `SUCCESS` |
+| `retry` | 可以安全重试 | `WAITING`，`attempt+1` |
+| `failure` | 按失败处理 | `FAILED` |
+
 自动重跑一个非幂等的数据库初始化步骤，会把目标机搞坏 —— 这条规则没有例外。
 
 ### 幂等分级
@@ -80,6 +132,18 @@ WAITING ──► PRECHECK ──► EXECUTING ──► VERIFYING ──┬─�
 | `DESTRUCTIVE` | 一律 `UNKNOWN`，绝不自动重跑 |
 
 ## Step（`ops_task_steps`）
+
+```
+PENDING ──► RUNNING ──┬──► SUCCESS
+                     ├──► FAILED
+                     ├──► CANCELLED
+                     └──► UNKNOWN
+PENDING ──► CANCELLED / SKIPPED
+UNKNOWN ──► SUCCESS / FAILED / CANCELLED
+```
+
+`SUCCESS` / `FAILED` / `SKIPPED` / `CANCELLED` 都是硬终态，没有出边；`UNKNOWN` 的出边
+同样只有人工裁定能走。步骤断电后重跑靠**新 attempt 行**，不改旧行。
 
 唯一键 `(run_id, step_key, attempt)`。`attempt` 只在真正重跑时 +1 —— **不靠重复插行**表达重试，
 因为 `ops_task_runs` 上有 `UNIQUE(task_id, server_id)`，Run 本身就是单行的。

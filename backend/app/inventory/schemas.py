@@ -140,11 +140,3 @@ class HostKeyAcceptRequest(BaseModel):
     @classmethod
     def _strip(cls, v: object) -> object:
         return v.strip() if isinstance(v, str) else v
-
-
-class ServerCheckResult(BaseModel):
-    """Outcome of ``POST /servers/{id}/check``."""
-
-    ok: bool
-    detail: str
-    facts: FactsOut | None = None

@@ -8,12 +8,17 @@ worse than a row that says "this machine is no longer managed".
 from __future__ import annotations
 
 import datetime as dt
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from sqlalchemy import ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+# Imported at runtime, not under TYPE_CHECKING. ``Server.credential_id`` points
+# at ``ops_credentials.id`` by name, and SQLAlchemy can only resolve that when
+# the table is already in this MetaData — which is not guaranteed by whichever
+# module happens to be imported first.
+from backend.app.credentials.models import Credential
 from backend.app.db.base import (
     Base,
     BigIntPk,
@@ -23,9 +28,6 @@ from backend.app.db.base import (
     TimestampMixin,
     UTCDateTime,
 )
-
-if TYPE_CHECKING:  # pragma: no cover - import cycle guard
-    from backend.app.credentials.models import Credential
 
 # Server lifecycle. "deleted" is a soft delete: the row stays for audit.
 SERVER_ACTIVE = "active"
@@ -85,7 +87,7 @@ class Server(Base, TimestampMixin):
     last_check_detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
     credential: Mapped[Credential | None] = relationship(
-        "Credential", lazy="joined", back_populates="servers"
+        Credential, lazy="joined", back_populates="servers"
     )
     memberships: Mapped[list[ServerGroupMember]] = relationship(
         back_populates="server", cascade="all, delete-orphan", lazy="selectin"

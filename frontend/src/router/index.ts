@@ -31,6 +31,16 @@ const router = createRouter({
           name: 'credentials',
           component: () => import('@/views/Credentials.vue'),
         },
+        {
+          path: 'tasks',
+          name: 'tasks',
+          component: () => import('@/views/Tasks.vue'),
+        },
+        {
+          path: 'tasks/:id',
+          name: 'task-detail',
+          component: () => import('@/views/TaskDetail.vue'),
+        },
       ],
     },
   ],

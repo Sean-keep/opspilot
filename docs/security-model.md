@@ -17,6 +17,7 @@ OpsPilot 是一个**能远程改动服务器的控制台**。它一旦被攻破�
 | 非幂等步骤被自动重跑 | `UNKNOWN` 状态，强制人工裁决 |
 | 中间人 / 主机冒充 | SSH 主机密钥校验开启，首次接入显式指纹确认 |
 | 提权 | 非 root SSH；受限 sudo 白名单；systemd 加固 |
+| API 进程被攻破 | 解密与命令执行只在 Worker；API 不碰密钥、不开命令通道（见「谁去连主机」） |
 
 ## 认证
 
@@ -143,13 +144,26 @@ Paramiko 的 `exec_command` 收的是字符串，对端走登录 shell 解析；
 `staged_private_key()`：`mkstemp` + `fchmod 0600` + `fsync`，连接结束（含异常）后
 `unlink`。API 响应里也没有任何字段能装下它 —— `CredentialOut` 根本没有这个字段。
 
-### S1 边界：谁去连主机
+### 谁去连主机
 
-S1 的 `POST /servers/{id}/check` 是只读检查，固定 argv，由 API 进程同步执行（任务引擎
-在 S2 才有）。这是文档化的取舍：在 Worker/任务模型存在之前，检查必须有个落点。执行
-逻辑本身挂在 `ExecPort` 协议后面（`backend/app/executor/`），S2 把同一个实现搬进
-Worker 即可，API 那一侧不再解密凭据、不再开 socket。S3 起的所有**动作**执行只在
-Worker。
+**只有 Worker。**
+
+S2 收口后，API 进程**不碰凭据、不开命令通道**：`POST /servers/{id}/check` 只做同步的
+前置检查（主机密钥是否已确认、凭据是否已绑定、状态是否可用、SSH 用户是否确定），
+通过就入队一个 `server.check` 任务，返回 `202` + `Location: /api/v1/tasks/{id}`。
+解密、`staged_private_key()`、Paramiko 连接、命令执行全部在 Worker 进程里。
+
+这样划分的理由很直白：API 是面向浏览器的攻击面，Worker 不是。把解密密钥的使用点
+收进一个不接公网的进程，泄密面就小一截。`backend/tests/test_check_via_worker.py` 里有一条
+`test_the_api_never_builds_a_transport`，把 `SshExecPort` 换成一个会炸的假件 —— API 侧
+只要碰一下 socket，测试就红。
+
+**文档化的例外：`discover_host_key` 仍在 API 进程。** 它做的是未认证的 banner/公钥
+握手：不认 SSH、不取凭据、不解密任何东西、不执行任何命令，只是读取对端主动提供的
+公钥指纹。它无法用密钥做任何事，所以留在 API 是安全的，而且必须留在 API —— 操作员要
+当场看到指纹并逐字确认，让 Worker 异步去做就没人看了。这一条写在这里，不是疏漏。
+
+S3 起的所有**动作**执行也只在 Worker。
 
 ## 远端执行边界
 

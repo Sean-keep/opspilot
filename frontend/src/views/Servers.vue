@@ -133,19 +133,10 @@ async function runCheck(server: ServerOut): Promise<void> {
   busy.value = { ...busy.value, [server.id]: 'check' }
   clearRow(server.id)
   try {
-    const result = await checkServer(server.id)
-    if (result.ok) {
-      const f = result.facts
-      setRow(
-        server.id,
-        'ok',
-        f
-          ? `检查通过：${f.os_name} ${f.os_version} · ${f.cpu_count} 核 · 内存 ${f.memory_total_mb} MB`
-          : '检查通过',
-      )
-    } else {
-      setRow(server.id, 'bad', `检查失败：${result.detail}`)
-    }
+    // The API only enqueues. The Worker opens the SSH session, collects the
+    // facts, and writes them back — the row shows them after the task ends.
+    const task = await checkServer(server.id)
+    setRow(server.id, 'ok', `检查已排队（任务 #${task.id}），完成后系统事实会自动更新`)
     await load()
   } catch (cause) {
     setRow(server.id, 'bad', messageOf(cause))

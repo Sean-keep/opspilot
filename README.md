@@ -278,17 +278,21 @@ journalctl -u opspilot-api -n 50 --no-pager
 
 ---
 
-## 已知限制（S1）
+## 已知限制（S2）
 
 - 登录失败限速计数在**进程内存**里。API 以单进程跑在 systemd 下时够用；若将来水平扩展，
   需要把计数挪到 MySQL。见 `docs/security-model.md`。
-- **连通性检查由 API 进程同步执行**（S1 没有任务引擎）。它只跑固定只读 argv，且必须
-  先过主机密钥信任。S2 把执行搬进 Worker 后，API 不再解密凭据、不再开 socket。
 - 凭据目前只支持 `ssh_key` 做连通性检查；`ssh_password` / `sudo_password` 已能存取，
   使用它们的通道在 S3 的 Action Registry 里接。
-- 任务引擎、SSE、模板协议、应用发布尚未实现（S2–S4）。
-- Worker 目前是可启动 / 可优雅退出的空转循环，认领逻辑在 S2 填入。
-- 前端有登录、外壳、健康状态、服务器、凭据五个页面；其余侧栏条目标注「即将开放」。
+- **API 进程不碰凭据、不开命令通道。** `POST /servers/{id}/check` 只做前置检查并入队，
+  解密与 SSH 全在 Worker。唯一的例外是 `discover_host_key`：未认证的公钥握手，不取凭据、
+  不执行命令，必须留在 API 才能让操作员当场确认指纹。
+- SSE 的 token 走查询参数（`EventSource` 设不了请求头）。该端点只读，且后端单独校验
+  `task.read`。见 `docs/security-model.md`。
+- 取消只停后续步骤，**不回滚**。回滚是独立任务，S4 才有 `POST /deployments/{id}/rollback`。
+- 模板协议、应用发布尚未实现（S3–S4）。
+- 前端有登录、外壳、健康状态、服务器、凭据、任务（列表 + 详情）六个页面；模板 / 应用 /
+  发布记录 / 审计日志仍标注「即将开放」。
 
 ---
 
@@ -352,3 +356,44 @@ find . -iname '*docker*' -o -iname 'Dockerfile*' -o -iname 'docker-compose*'
   正确确认后 check 采到 `ubuntu-24.04 / x86_64 / 12 核 / 15940 MB / 1006.85 GB`；
   所有响应体与审计行均无密钥材料；注入 payload `echo 'hello; touch /tmp/opspilot-pwned'`
   保持单个 argv token，文件未生成。
+
+---
+
+## S2 收口记录
+
+在 S1 之上新增：任务 / Run / Step / 日志四张表与 Outbox、独立 Worker（原子认领 + 租约
+心跳 + 过期恢复）、取消证据、`UNKNOWN` 人工裁定、SSE 事件流、任务列表与详情页。
+
+**S1 → S2 接缝已经完成。** API 进程不再解密凭据、不再开命令通道：`POST /servers/{id}/check`
+只做前置检查并入队，返回 `202` + `Location: /api/v1/tasks/{id}`；解密、私钥暂存、
+Paramiko 连接、命令执行全部在 Worker。唯一的例外是 `discover_host_key`（未认证公钥握手，
+不取凭据、不执行命令），见 `docs/security-model.md`。
+
+门禁命令与 S0 相同，真实结果：
+
+- `alembic upgrade head` 连跑两次 → 第二次无 `Running upgrade`
+- `pytest backend/tests worker/tests shared/tests` → **262 passed**（S1 时 159）
+- `ruff check .` → All checks passed
+- `mypy backend worker shared` → Success: no issues found in 94 source files
+- `npm run lint` / `typecheck` / `test`（25 passed）/ `build` → 全绿
+- `find . -iname '*docker*' …` → 空
+
+S2 新增的并发与恢复测试（都在真 MySQL 上跑）：
+
+| 测试 | 锁死了什么 |
+|---|---|
+| `test_two_workers_claim_disjoint_runs` | 两并发 Worker 认领，只有一方拿到 |
+| `test_task_idempotency_key_is_unique` 等三条 | 三个唯一约束真的会抛 `IntegrityError` |
+| `test_safe_step_is_requeued_when_the_host_is_reachable` | 幂等步骤租约过期后可重排，且 `attempt` 不加 |
+| `test_destructive_step_is_parked_as_unknown` | 非幂等步骤一律 `UNKNOWN` |
+| `test_unreachable_host_is_unknown_even_for_safe_steps` | 连不上就 `UNKNOWN`，不猜 |
+| `test_unknown_is_not_reclaimed_as_work` | `UNKNOWN` 不会被下一轮再认领 |
+| `test_cancel_mid_step_records_remote_evidence` | 取消留远端证据，不是只改状态列 |
+| `test_the_api_never_builds_a_transport` | API 侧只要碰 socket 测试就红 |
+
+**已知取舍（S2）：**
+
+- SSE 事件流用 `?token=` 传访问令牌（`EventSource` 设不了请求头）。端点只读，且单独校验
+  `task.read`。若反代能透传 `Authorization`，应改成走头。
+- `server.check` 目前是唯一的任务类型。模板与发布（S3/S4）接入后才会出现多步骤计划。
+- 取消只停后续步骤，不回滚；回滚任务在 S4。

@@ -1,21 +1,25 @@
 """Server inventory operations.
 
-Everything that changes a server row or talks to a host lives here, so the
-router stays a thin permission/HTTP layer and the Worker can reuse the same
-logic in S2 without importing FastAPI.
+Everything that changes a server row lives here, so the router stays a thin
+permission/HTTP layer.
+
+The API does **not** execute commands against managed hosts. It may *discover*
+a host key — an unauthenticated banner fetch that carries no credentials and
+runs nothing — and it may *enqueue* a check. The Worker is the only process
+that decrypts a credential and opens a session to run a command. This module
+enforces the preconditions for that hand-off and nothing more.
 
 Two rules are enforced here and not merely documented:
 
-* a command only runs when the host key state is ``verified`` and the offered
-  key still matches the pinned fingerprint;
-* the credential plaintext is staged to a mode-600 temp file for the length of
-  one connection and never appears on the returned objects.
+* work is only enqueued when the host key state is ``verified`` and a usable
+  ``ssh_key`` credential is bound;
+* the host key pin is dropped when the address changes, so a new endpoint is
+  treated as a new host.
 """
 
 from __future__ import annotations
 
 import hmac
-from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select
@@ -28,19 +32,9 @@ from backend.app.core.settings import Settings, get_settings
 from backend.app.credentials.models import CRED_SSH_KEY, Credential
 from backend.app.credentials.service import CredentialService
 from backend.app.db.base import utcnow
-from backend.app.executor.keys import staged_private_key
-from backend.app.executor.port import (
-    ExecContext,
-    ExecPort,
-    HostKeyError,
-    NotVerifiedError,
-    TransportError,
-)
-from backend.app.executor.ssh import SshExecPort, discover_host_key
-from backend.app.inventory.checks import CheckError, SystemFacts, collect_facts
+from backend.app.executor.port import TransportError
+from backend.app.executor.ssh import discover_host_key
 from backend.app.inventory.models import (
-    CHECK_FAILED,
-    CHECK_OK,
     HOSTKEY_MISMATCH,
     HOSTKEY_PENDING_CONFIRM,
     HOSTKEY_UNVERIFIED,
@@ -55,7 +49,6 @@ from backend.app.inventory.models import (
 from backend.app.inventory.schemas import (
     FactsOut,
     HostKeyDiscoverOut,
-    ServerCheckResult,
     ServerCreate,
     ServerGroupOut,
     ServerOut,
@@ -79,32 +72,16 @@ class HostKeyMismatch(Conflict):
     code = "host_key_mismatch"
 
 
-@dataclass(frozen=True, slots=True)
-class CheckOutcome:
-    """Internal result of one connectivity + facts check."""
-
-    ok: bool
-    detail: str
-    facts: SystemFacts | None = None
-
-
 class InventoryService:
-    """Server CRUD, host-key trust, and the read-only environment check."""
+    """Server CRUD, host-key trust, and check preconditions."""
 
     def __init__(
         self,
         session: Session,
         settings: Settings | None = None,
-        *,
-        port: ExecPort | None = None,
     ) -> None:
         self.session = session
         self.settings = settings or get_settings()
-        # Injected so tests can supply a fake transport without a socket.
-        self.port: ExecPort = port or SshExecPort(
-            connect_timeout=self.settings.ssh_connect_timeout,
-            default_timeout=self.settings.ssh_command_timeout,
-        )
 
     # ------------------------------------------------------------------
     # Reads
@@ -429,112 +406,43 @@ class InventoryService:
         return row
 
     # ------------------------------------------------------------------
-    # Connectivity + environment check
+    # Environment check — the S1 -> S2 seam
     # ------------------------------------------------------------------
-    def run_check(
-        self,
-        server_id: int,
-        *,
-        actor_id: int | None = None,
-    ) -> tuple[Server, ServerCheckResult]:
-        """Run the read-only facts collection and record the outcome.
+    def require_checkable(self, server_id: int) -> Server:
+        """Return a server that is safe to enqueue work against.
 
-        Returns the updated server and a result. A *failed check* is a result
-        (``ok=False``), not an HTTP error: "the host is down" is an answer the
-        operator asked for. A trust failure (unverified / mismatched host key)
-        raises, because running the command at all would be wrong.
+        Since S2 the API no longer runs the check itself: it validates the
+        preconditions and hands a task to the Worker, which is the only process
+        that decrypts credentials and opens a session to a managed host.
+
+        The preconditions are still enforced here, synchronously, because
+        enqueueing work that is known to be wrong helps nobody:
+
+        * the host key must already be verified by a human;
+        * the server must have an active ``ssh_key`` credential bound.
+
+        Anything that needs the network is the Worker's problem.
         """
         row = self.require(server_id)
         self._require_trusted_host_key(row)
 
-        try:
-            facts = self._collect(row)
-        except (HostKeyError, NotVerifiedError) as exc:
-            self._record_check(row, CHECK_FAILED, str(exc))
-            write_audit(
-                "server.check",
-                actor_id=actor_id,
-                target_type="server",
-                target_id=str(row.id),
-                snapshot={"name": row.name, "outcome": "host_key_error"},
-                result=RESULT_FAILURE,
-            )
-            raise
-        except (TransportError, CheckError) as exc:
-            detail = _safe_detail(exc)
-            self._record_check(row, CHECK_FAILED, detail)
-            write_audit(
-                "server.check",
-                actor_id=actor_id,
-                target_type="server",
-                target_id=str(row.id),
-                snapshot={"name": row.name, "outcome": "failed", "detail": detail},
-                result=RESULT_FAILURE,
-            )
-            return row, ServerCheckResult(ok=False, detail=detail, facts=None)
-
-        snapshot = self._persist_facts(row, facts)
-        self._record_check(row, CHECK_OK, "system facts collected")
-        write_audit(
-            "server.check",
-            actor_id=actor_id,
-            target_type="server",
-            target_id=str(row.id),
-            snapshot={
-                "name": row.name,
-                "outcome": "ok",
-                "os": f"{facts.os_name}-{facts.os_version}",
-                "arch": facts.arch,
-                "cpu_count": facts.cpu_count,
-            },
-        )
-        out = self.to_out(row, facts=snapshot)
-        return row, ServerCheckResult(
-            ok=True, detail="system facts collected", facts=out.latest_facts
-        )
-
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-    def _collect(self, row: Server) -> SystemFacts:
-        """Run the facts check over SSH with the credential staged to disk."""
-        user = row.ssh_user or self.settings.ssh_user
-        if not user:
-            raise ValidationError("server has no ssh_user and OPSPILOT_SSH_USER is unset")
-
-        secret = self._credential_secret(row)
-        with staged_private_key(secret) as key_path:
-            ctx = ExecContext(
-                host=row.hostname,
-                port=row.port,
-                user=user,
-                credential_id=row.credential_id,
-                timeout=self.settings.ssh_command_timeout,
-                host_key_fingerprint=row.host_key_fingerprint,
-                extra={"key_filename": key_path},
-            )
-            return collect_facts(self.port, ctx)
-
-    def _credential_secret(self, row: Server) -> str:
         if row.credential_id is None:
             raise ValidationError(
                 "server has no credential attached; add one before running a check"
             )
-        creds = CredentialService(self.session, self.settings)
-        cred = creds.require(row.credential_id)
+        cred = self._require_usable_credential(int(row.credential_id))
         if cred.kind != CRED_SSH_KEY:
             raise ValidationError(
                 f"credential {cred.name!r} is of kind {cred.kind!r}; "
                 "only ssh_key credentials can be used for a connectivity check"
             )
-        if cred.status != "active":
-            raise ValidationError(f"credential {cred.name!r} is retired")
-        # Decrypting here is the one place the API touches plaintext, and it
-        # lives only inside staged_private_key's temp file. Never logged.
-        secret = creds.decrypt(cred.id)
-        creds.mark_used(cred.id)
-        return secret
+        if not (row.ssh_user or self.settings.ssh_user):
+            raise ValidationError("server has no ssh_user and OPSPILOT_SSH_USER is unset")
+        return row
 
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
     def _require_trusted_host_key(self, row: Server) -> None:
         if not row.host_key_fingerprint:
             raise HostKeyNotVerified(
@@ -562,32 +470,6 @@ class InventoryService:
         row.host_key_state = HOSTKEY_UNVERIFIED
         row.host_key_accepted_at = None
 
-    def _persist_facts(self, row: Server, facts: SystemFacts) -> ServerFacts:
-        snapshot = ServerFacts(
-            server_id=row.id,
-            collected_at=utcnow(),
-            os_name=facts.os_name[:128],
-            os_version=facts.os_version[:128],
-            kernel=facts.kernel[:128],
-            arch=facts.arch[:32],
-            cpu_count=facts.cpu_count,
-            cpu_model=facts.cpu_model[:128],
-            memory_total_mb=facts.memory_total_mb,
-            memory_available_mb=facts.memory_available_mb,
-            disk_total_gb=facts.disk_total_gb,
-            disk_available_gb=facts.disk_available_gb,
-            raw_json=None,
-        )
-        self.session.add(snapshot)
-        self.session.flush()
-        return snapshot
-
-    def _record_check(self, row: Server, status: str, detail: str) -> None:
-        row.last_check_at = utcnow()
-        row.last_check_status = status
-        row.last_check_detail = detail[:4000]
-        self.session.flush()
-
 
 # --------------------------------------------------------------------------
 # Small validators shared by create/update (schemas do the HTTP-side ones).
@@ -605,16 +487,3 @@ def _validate_user(value: str) -> str:
     if value and not all(c.isalnum() or c in "_-" for c in value):
         raise ValidationError("ssh_user must be a plain username")
     return value
-
-
-def _safe_detail(exc: Exception) -> str:
-    """A one-line, secret-free description of a failed check.
-
-    Transport errors can quote a socket error; they never carry credential
-    material, but the text is still passed through redaction before it is
-    stored so a stray secret in a future error string cannot land in the DB.
-    """
-    from shared.redaction import redact_text
-
-    text = str(exc) or exc.__class__.__name__
-    return redact_text(text).replace("\n", " ")[:1000]

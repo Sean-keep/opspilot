@@ -14,12 +14,16 @@ from backend.app.audit.router import router as audit_router
 from backend.app.auth.router import router as auth_router
 from backend.app.credentials.router import router as credentials_router
 from backend.app.inventory.router import router as inventory_router
+from backend.app.orchestrator.router import router as tasks_router
+from backend.app.orchestrator.router import run_router as task_runs_router
 
 api_v1 = APIRouter(prefix="/api/v1")
 api_v1.include_router(auth_router)
 api_v1.include_router(audit_router)
 api_v1.include_router(inventory_router)
 api_v1.include_router(credentials_router)
+api_v1.include_router(tasks_router)
+api_v1.include_router(task_runs_router)
 
 root = APIRouter()
 root.include_router(health.router)
