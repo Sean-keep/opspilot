@@ -60,6 +60,12 @@ from shared.task_protocol import (
     ensure_run_transition,
 )
 from shared.task_protocol.claim import ClaimedRun, renew_leases
+from shared.templates import (
+    SERVER_VALUE_KEYS,
+    TemplateApplyParams,
+    TemplateError,
+    plan_template_apply,
+)
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
@@ -68,7 +74,9 @@ log = get_logger(__name__)
 #: Kinds this worker executes. Widened together with
 #: ``backend.app.orchestrator.service.TASK_KINDS`` — a kind one side accepts and
 #: the other ignores is a task that sits in the queue forever.
-SUPPORTED_KINDS = frozenset({"server.check", "app.deploy", "app.rollback"})
+SUPPORTED_KINDS = frozenset(
+    {"server.check", "app.deploy", "app.rollback", "template.apply"}
+)
 
 
 class RunBlocked(Exception):
@@ -249,6 +257,7 @@ class Runner:
             "server.check": self._run_server_check,
             "app.deploy": self._run_deploy,
             "app.rollback": self._run_deploy,
+            "template.apply": self._run_template_apply,
         }[claimed.kind]
 
         try:
@@ -494,6 +503,65 @@ class Runner:
                 f"{outcome.detail}; rolled back to {plan.restore_release_id}",
                 failed_step_key=outcome.failed_step_key,
             )
+
+    def _run_template_apply(self, claimed: ClaimedRun, run: TaskRun) -> RunOutcome:
+        """Run one published template's plan on one host.
+
+        Deliberately **no restore policy**. ``app.deploy`` can undo itself
+        because the release layout leaves it a previous ``current`` to put back;
+        a template has no such half-live state. "Un-create the user" or
+        "unwrite the config" are separate work with separate permissions, so a
+        failure stops at the failing step, says which one, and leaves the
+        already-completed steps standing.
+        """
+        try:
+            payload = TemplateApplyParams.model_validate(dict(claimed.params or {}))
+        except ValueError as exc:
+            raise RunBlocked(redact_text(f"invalid template.apply body: {exc}")) from exc
+
+        server = self._load_server(run.server_id)
+        if server is None:
+            raise RunBlocked(f"server {run.server_id} no longer exists")
+        self._require_verified_host(run, server)
+
+        ref = payload.template
+        try:
+            # The bundle is resolved here, never on the API side: a ref in the
+            # task, plaintext only in this process.
+            secrets = self._load_config_secrets(payload.config_ref)
+            plan = plan_template_apply(
+                payload, self._server_field_map(server), secrets=secrets
+            )
+        except TemplateError as exc:
+            raise RunBlocked(redact_text(str(exc))) from exc
+
+        self.log(
+            run.id,
+            f"applying template {ref.name} {ref.version} "
+            f"({len(plan)} steps, checksum {ref.checksum[:12]}) "
+            f"onto server {run.server_id}",
+        )
+
+        with self._session_to(server) as (ctx, port):
+            outcome = self._run_plan_steps(run, plan, ctx, port)
+
+        if outcome is None:
+            self.log(run.id, f"template {ref.name} {ref.version} applied")
+            return self._succeed(run, self._last_step(run))
+
+        if outcome.cancelled:
+            # ``_cancel_before_work`` / ``_cancel_during_step`` already parked
+            # the run; only the caller's logging is left to do.
+            return outcome
+
+        self.log(
+            run.id,
+            f"template {ref.name} {ref.version} stopped at {outcome.failed_step_key}",
+            level="error",
+        )
+        return self._fail(
+            run, outcome.detail, failed_step_key=outcome.failed_step_key
+        )
 
     def _run_plan_steps(
         self,
@@ -960,7 +1028,7 @@ class Runner:
         row = self.session.execute(
             text(
                 """
-                SELECT id, hostname, port, ssh_user, credential_id,
+                SELECT id, name, hostname, port, ssh_user, credential_id,
                        host_key_state, host_key_fingerprint
                   FROM ops_servers
                  WHERE id = :id
@@ -969,6 +1037,21 @@ class Runner:
             {"id": server_id},
         ).mappings().first()
         return dict(row) if row is not None else None
+
+    @staticmethod
+    def _server_field_map(server: dict[str, Any]) -> dict[str, Any]:
+        """The ``{{ server.x }}`` names a template may read from this host.
+
+        Whitelist, not passthrough: ``credential_id`` and
+        ``host_key_fingerprint`` are in the same row and a template must not be
+        able to name them. ``shared.templates.SERVER_VALUE_KEYS`` is the
+        declared set, and a name outside it is already refused at template load.
+        """
+        return {
+            key: server[key]
+            for key in SERVER_VALUE_KEYS
+            if key in server and server[key] is not None
+        }
 
     def _load_credential_payload(self, credential_id: int) -> str:
         # `scalar_one_or_none` on a bare `text()` clause infers `None`; the

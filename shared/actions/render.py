@@ -27,15 +27,21 @@ import re
 from collections.abc import Mapping
 from typing import Any, Final
 
+from shared.config import get_settings
+
 __all__ = [
+    "ALLOWED_PATH_PREFIXES",
+    "DEFAULT_ALLOWED_PATH_PREFIXES",
     "PLACEHOLDER_RE",
     "USERNAME_RE",
     "VALID_VALUE_KEYS",
     "RenderError",
+    "allowed_path_prefixes",
     "find_placeholders",
     "render",
     "validate_path",
     "validate_read_path",
+    "validate_read_path_or_empty",
     "validate_template_text",
     "validate_value_for",
 ]
@@ -71,15 +77,27 @@ SERVICE_NAME_RE: Final = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9@_.:-]{0,127}$")
 PACKAGE_RE: Final = re.compile(r"^[a-z0-9][a-z0-9+.-]{0,63}$")
 PORT_RE: Final = re.compile(r"^[0-9]{1,5}$")
 
-#: Remote path prefixes a template may write to. Anything else is a traversal
-#: attempt or an accident; both must be refused.
-ALLOWED_PATH_PREFIXES: Final = (
+#: Remote path prefixes a template may write to by default. Anything else is a
+#: traversal attempt or an accident; both must be refused.
+#:
+#: ``/etc/redis/`` sits here for the same reason as ``/etc/nginx/`` and
+#: ``/etc/supervisor/conf.d/``: a shipped middleware template writes a config
+#: file there. Keep this tuple to paths the product itself manages.
+#:
+#: Operators whose deployments live elsewhere widen it with
+#: ``OPSPILOT_ALLOWED_WRITE_PREFIXES`` — see ``allowed_path_prefixes``.
+DEFAULT_ALLOWED_PATH_PREFIXES: Final = (
     "/opt/opspilot/apps/",
     "/opt/opspilot/test/",
     "/etc/systemd/system/",
     "/etc/supervisor/conf.d/",
     "/etc/nginx/",
+    "/etc/redis/",
 )
+
+#: The allowlist in force when no operator override is configured. Named for
+#: what the template tests assert against; it is always the default tuple.
+ALLOWED_PATH_PREFIXES: Final = DEFAULT_ALLOWED_PATH_PREFIXES
 
 #: Field names that take a value with a restricted shape.
 VALID_VALUE_KEYS: Final = frozenset(
@@ -171,13 +189,37 @@ def validate_read_path(value: str) -> str:
     return value
 
 
+def allowed_path_prefixes() -> tuple[str, ...]:
+    """The write allowlist currently in force.
+
+    Defaults to :data:`DEFAULT_ALLOWED_PATH_PREFIXES`. An operator whose
+    deployments live outside them sets ``OPSPILOT_ALLOWED_WRITE_PREFIXES``, and
+    the API and every worker must then carry the **same** value — a plan the
+    API accepted would otherwise be refused at execution time.
+    """
+    override = get_settings().write_prefixes()
+    return override or DEFAULT_ALLOWED_PATH_PREFIXES
+
+
+def validate_read_path_or_empty(value: str) -> str:
+    """An optional probe path: a real one, or ``""`` for "do not probe".
+
+    Distinct from :func:`validate_read_path` because the empty default of an
+    optional field is re-validated on the round trip through ``model_dump()`` —
+    a bare ``ReadPath = ""`` refuses itself.
+    """
+    if value == "":
+        return value
+    return validate_read_path(value)
+
+
 def validate_path(value: str) -> str:
     """A remote path that will be **written** must also be inside an allowlist."""
     validate_read_path(value)
-    if not any(value.startswith(p) for p in ALLOWED_PATH_PREFIXES):
-        allowed = ", ".join(ALLOWED_PATH_PREFIXES)
+    allowed = allowed_path_prefixes()
+    if not any(value.startswith(p) for p in allowed):
         raise RenderError(
-            f"path {value!r} is outside the allowed prefixes ({allowed})"
+            f"path {value!r} is outside the allowed prefixes ({', '.join(allowed)})"
         )
     return value
 
@@ -199,6 +241,13 @@ def validate_value_for(field: str, value: Any, *, path_mode: str = "write") -> A
         return value
 
     if field in {"packages"}:
+        if isinstance(value, str):
+            # One element of a literal ``packages: [...]`` list. The template
+            # walker visits it as ``params.packages[0]`` and hands us the item,
+            # so it is a *name* to check, not the list field to re-shape.
+            if not PACKAGE_RE.match(value):
+                raise RenderError(f"invalid package name {value!r}")
+            return value
         if not isinstance(value, (list, tuple)):
             raise RenderError(f"{field} must be a list of package names")
         for item in value:

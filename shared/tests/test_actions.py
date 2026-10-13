@@ -33,13 +33,16 @@ from shared.actions.builtin import (
     ensure_sudo_allowed,
 )
 from shared.actions.render import (
+    DEFAULT_ALLOWED_PATH_PREFIXES,
     RenderError,
+    allowed_path_prefixes,
     find_placeholders,
     render,
     validate_path,
     validate_read_path,
     validate_template_text,
 )
+from shared.config import clear_settings_cache
 from shared.executor.port import ExecContext, ExecResult
 from shared.redaction import REDACTED, redact_text
 
@@ -286,6 +289,56 @@ def test_read_paths_may_leave_the_write_allowlist_but_not_travel() -> None:
     assert validate_read_path("/") == "/"
     with pytest.raises(RenderError):
         validate_read_path("/var/lib/../../etc/shadow")
+
+
+# ==========================================================================
+# The write allowlist is operator-extensible — and only that
+# ==========================================================================
+@pytest.fixture()
+def _settings_cache() -> Any:
+    """``get_settings`` is cached; a test that touches env must clear it."""
+    clear_settings_cache()
+    yield
+    clear_settings_cache()
+
+
+def test_the_default_allowlist_is_the_documented_one(_settings_cache: Any) -> None:
+    assert allowed_path_prefixes() == DEFAULT_ALLOWED_PATH_PREFIXES
+    # middleware/redis74 renders /etc/redis/redis.conf — the same class of
+    # managed config as /etc/nginx/ and /etc/supervisor/conf.d/.
+    assert "/etc/redis/" in DEFAULT_ALLOWED_PATH_PREFIXES
+
+
+def test_a_setting_replaces_the_default_allowlist_wholesale(
+    _settings_cache: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replace, not union.
+
+    Union would mean the setting can only ever widen the boundary, never
+    tighten it — an operator who wants to confine the product to one app tree
+    could not say so. Replace is the only semantic that supports both.
+    """
+    monkeypatch.setenv(
+        "OPSPILOT_ALLOWED_WRITE_PREFIXES", "/opt/20kpay/, /www/python/"
+    )
+    clear_settings_cache()
+    assert allowed_path_prefixes() == ("/opt/20kpay/", "/www/python/")
+    assert validate_path("/opt/20kpay/api/venv") == "/opt/20kpay/api/venv"
+    assert validate_path("/www/python/venv/bin/python") == "/www/python/venv/bin/python"
+    with pytest.raises(RenderError):
+        validate_path("/etc/nginx/nginx.conf")
+
+
+def test_a_suffixed_sibling_is_not_matched_by_a_prefix(
+    _settings_cache: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """/opt/20kpay/ must not admit /opt/20kpay-evil/."""
+    monkeypatch.setenv("OPSPILOT_ALLOWED_WRITE_PREFIXES", "/opt/20kpay")
+    clear_settings_cache()
+    assert allowed_path_prefixes() == ("/opt/20kpay/",)
+    assert validate_path("/opt/20kpay/api") == "/opt/20kpay/api"
+    with pytest.raises(RenderError):
+        validate_path("/opt/20kpay-evil/api")
 
 
 # ==========================================================================

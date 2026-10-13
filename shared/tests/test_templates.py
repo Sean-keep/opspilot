@@ -21,11 +21,15 @@ from shared.templates import (
     PUBLISHED,
     STATUS_TRANSITIONS,
     TEMPLATE_STATUSES,
+    TemplateApplyParams,
     TemplateError,
     TemplateSpec,
+    build_template_plan,
     compute_checksum,
     dry_run_params,
     load_template,
+    plan_template_apply,
+    validate_apply_inputs,
     validate_template,
 )
 
@@ -440,3 +444,306 @@ def test_a_published_version_cannot_move_back_to_draft() -> None:
 
 def test_every_status_has_a_transition_table_entry() -> None:
     assert set(STATUS_TRANSITIONS) == set(TEMPLATE_STATUSES)
+
+
+# ==========================================================================
+# build_template_plan — a published template becomes runnable work
+# ==========================================================================
+def test_a_template_renders_into_plan_steps_in_order() -> None:
+    spec = _spec(*GOOD_STEPS)
+    plan = build_template_plan(
+        spec, SCHEMA, {"app_user": "svc20k", "app_root": "/opt/opspilot/apps/20kpay-api"}
+    )
+    assert [s.key for s in plan] == ["check_os", "ensure_user", "make_root"]
+    assert [s.action for s in plan] == [
+        "system.check_os",
+        "system.ensure_user",
+        "file.render",
+    ]
+    assert plan[1].params == {"username": "svc20k", "shell": "/usr/sbin/nologin"}
+    assert plan[2].params["path"] == "/opt/opspilot/apps/20kpay-api/venv"
+
+
+def test_each_step_carries_the_action_declared_idempotency_class() -> None:
+    spec = _spec(*GOOD_STEPS)
+    plan = build_template_plan(
+        spec, SCHEMA, {"app_user": "svc20k", "app_root": "/opt/opspilot/apps/20kpay-api"}
+    )
+    classes = {s.key: s.idempotency_class for s in plan}
+    assert classes["check_os"] == "SAFE"
+    assert classes["ensure_user"] == "CONDITIONAL"
+    assert classes["make_root"] == "CONDITIONAL"
+
+
+def test_a_missing_required_input_is_refused_before_anything_renders() -> None:
+    spec = _spec(*GOOD_STEPS)
+    with pytest.raises(TemplateError, match="missing required input 'app_root'"):
+        build_template_plan(spec, SCHEMA, {"app_user": "svc20k"})
+
+
+def test_an_undeclared_input_is_refused() -> None:
+    spec = _spec(*GOOD_STEPS)
+    with pytest.raises(TemplateError, match="not declared in the inputs schema"):
+        build_template_plan(
+            spec,
+            SCHEMA,
+            {"app_user": "svc20k", "app_root": "/opt/x", "nope": "1"},
+        )
+
+
+def test_a_value_the_action_would_refuse_fails_the_whole_plan() -> None:
+    """One bad step must not yield a partially built plan to run.
+
+    ``make_root`` is legal, so the refusal has to come from ``switch`` — a
+    ``release_id`` of ``latest`` is exactly what production deploys forbid. If
+    the earlier step were the one to fail, this test would be asserting the
+    wrong thing.
+    """
+    spec = _spec(
+        {
+            "key": "make_root",
+            "action": "file.render",
+            "params": {
+                "path": "{{ inputs.app_root }}/venv",
+                "kind": "directory",
+                "mode": "0750",
+                "owner": "{{ inputs.app_user }}",
+            },
+        },
+        {
+            "key": "switch",
+            "action": "app.switch_current",
+            "params": {
+                "app_root": "{{ inputs.app_root }}",
+                "release_id": "{{ inputs.release }}",
+            },
+        },
+    )
+    with pytest.raises(TemplateError, match=r"step 'switch'"):
+        build_template_plan(
+            spec,
+            {
+                "type": "object",
+                "required": ["app_user", "app_root", "release"],
+                "properties": {
+                    "app_user": {"type": "string", "default": "deploy"},
+                    "app_root": {"type": "string", "default": "/opt/opspilot/apps/x"},
+                    "release": {"type": "string", "default": "1.4.2"},
+                },
+            },
+            {
+                "app_user": "svc",
+                "app_root": "/opt/opspilot/apps/x",
+                "release": "latest",
+            },
+        )
+
+
+def test_server_fields_are_substituted_from_the_host_being_worked_on() -> None:
+    spec = _spec(
+        {
+            "key": "note",
+            "action": "file.render",
+            "params": {
+                "path": "/opt/opspilot/apps/x/note",
+                "kind": "file",
+                "content": "on {{ server.hostname }} as {{ inputs.app_user }}",
+            },
+        }
+    )
+    plan = build_template_plan(
+        spec,
+        {
+            "type": "object",
+            "required": ["app_user"],
+            "properties": {"app_user": {"type": "string"}},
+        },
+        {"app_user": "svc20k"},
+        {"hostname": "pay-07.internal"},
+    )
+    assert plan[0].params["content"] == "on pay-07.internal as svc20k"
+
+
+def test_a_switch_step_is_marked_as_flipping_the_link() -> None:
+    spec = _spec(
+        {
+            "key": "switch",
+            "action": "app.switch_current",
+            "params": {
+                "app_root": "/opt/opspilot/apps/20kpay-api",
+                "release_id": "1.4.2",
+            },
+        }
+    )
+    plan = build_template_plan(spec, {"type": "object", "properties": {}}, {})
+    assert plan[0].flips_link is True
+    # ...and a step that is not the switch must never claim to be.
+    spec2 = _spec(
+        {
+            "key": "render",
+            "action": "file.render",
+            "params": {"path": "/opt/opspilot/apps/x/f", "kind": "file", "content": "x"},
+        }
+    )
+    assert (
+        build_template_plan(spec2, {"type": "object", "properties": {}}, {})[0].flips_link
+        is False
+    )
+
+
+def test_the_plan_for_the_same_inputs_is_reproducible() -> None:
+    """What the API approves is what the worker runs — twice must be equal."""
+    spec = _spec(*GOOD_STEPS)
+    inputs = {
+        "app_user": "svc20k",
+        "app_root": "/opt/opspilot/apps/20kpay-api",
+    }
+    assert build_template_plan(spec, SCHEMA, inputs) == build_template_plan(
+        spec, SCHEMA, inputs
+    )
+
+
+# ==========================================================================
+# template.apply — the wire body and the plan it commits to
+# ==========================================================================
+def _apply_payload(**overrides: Any) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "template": {
+            "name": "demo",
+            "version": "1.0.0",
+            "checksum": "a" * 64,
+        },
+        "spec": _spec(*GOOD_STEPS).model_dump(),
+        "inputs_schema": SCHEMA,
+        "inputs": {"app_user": "svc20k", "app_root": "/opt/opspilot/apps/20kpay-api"},
+    }
+    body.update(overrides)
+    return body
+
+
+def test_the_apply_body_carries_the_thing_it_pins() -> None:
+    params = TemplateApplyParams.model_validate(_apply_payload())
+    assert params.template.name == "demo"
+    assert params.template.checksum == "a" * 64
+    assert params.config_ref == ""
+    # The body is self-contained: the worker never has to ask the catalog.
+    assert params.spec.steps[0].action == "system.check_os"
+
+
+def test_the_apply_body_refuses_a_checksum_that_is_not_a_sha256() -> None:
+    with pytest.raises(ValidationError):
+        TemplateApplyParams.model_validate(_apply_payload(template={"name": "demo",
+                                                                   "version": "1.0.0",
+                                                                   "checksum": "short"}))
+
+
+def test_the_apply_body_refuses_unexpected_keys() -> None:
+    """A task body is not a place to smuggle extra instructions."""
+    with pytest.raises(ValidationError):
+        TemplateApplyParams.model_validate(_apply_payload(on_error="continue"))
+
+
+def test_an_apply_body_renders_the_same_plan_a_direct_build_would() -> None:
+    payload = _apply_payload()
+    assert plan_template_apply(payload) == build_template_plan(
+        _spec(*GOOD_STEPS), SCHEMA, payload["inputs"]
+    )
+
+
+def test_an_apply_body_that_cannot_render_is_refused_with_the_template_name() -> None:
+    payload = _apply_payload(inputs={"app_user": "svc20k"})
+    with pytest.raises(TemplateError, match=r"template 'demo' '1\.0\.0'"):
+        plan_template_apply(payload)
+
+
+def test_secrets_fill_xsecret_fields_but_stay_out_of_the_task_body() -> None:
+    """A field the template fills from config_ref is declared ``x-secret``.
+
+    The API checks the body at submit without the bundle, so a *required*
+    secret field must not make every submit fail — and it must not be accepted
+    in the body either, because the body is stored in ``ops_task_runs``.
+    """
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "app_user": {"type": "string"},
+            "db_password": {"type": "string", "x-secret": True},
+        },
+        "required": ["app_user", "db_password"],
+    }
+    spec = _spec(
+        {
+            "key": "write",
+            "action": "file.render",
+            "params": {
+                "path": "/opt/opspilot/apps/x/app.conf",
+                "kind": "file",
+                "content": "user={{ inputs.app_user }} pass={{ inputs.db_password }}",
+            },
+        }
+    )
+    inputs = {"app_user": "svc20k"}
+
+    # Submit-time: the required secret is excused, and it may not be posted.
+    assert validate_apply_inputs(schema, inputs) == []
+    assert any("x-secret" in e for e in validate_apply_inputs(schema, {**inputs,
+                                                                      "db_password": "x"}))
+
+    # Execution-time: the bundle arrives and fills the field.
+    plan = build_template_plan(
+        spec, schema, inputs, secrets={"db_password": "s3cret"}
+    )
+    assert plan[0].params["content"] == "user=svc20k pass=s3cret"
+    # ...and the non-secret half is unchanged by the merge.
+    assert "s3cret" not in json.dumps(inputs)
+
+
+def test_a_secret_must_still_be_a_declared_xsecret_input() -> None:
+    """config_ref is not a licence to introduce names the author never wrote."""
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"app_user": {"type": "string"}},
+        "required": ["app_user"],
+    }
+    spec = _spec(
+        {
+            "key": "write",
+            "action": "file.render",
+            "params": {
+                "path": "/opt/opspilot/apps/x/app.conf",
+                "kind": "file",
+                "content": "x={{ inputs.app_user }}",
+            },
+        }
+    )
+    with pytest.raises(TemplateError, match="not declared"):
+        build_template_plan(
+            spec, schema, {"app_user": "svc"}, secrets={"not_declared": "x"}
+        )
+
+
+def test_a_secret_cannot_fill_a_field_the_author_did_not_mark() -> None:
+    """Otherwise config_ref would be a second, unaudited inputs channel."""
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"app_user": {"type": "string"}},
+        "required": ["app_user"],
+    }
+    spec = _spec(
+        {
+            "key": "write",
+            "action": "file.render",
+            "params": {
+                "path": "/opt/opspilot/apps/x/app.conf",
+                "kind": "file",
+                "content": "u={{ inputs.app_user }}",
+            },
+        }
+    )
+    with pytest.raises(TemplateError, match="not declared x-secret"):
+        build_template_plan(
+            spec, schema, {"app_user": "svc"}, secrets={"app_user": "evil"}
+        )

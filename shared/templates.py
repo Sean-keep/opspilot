@@ -27,7 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -42,9 +42,11 @@ from shared.actions.render import (
     find_placeholders,
     render,
     validate_read_path,
+    validate_read_path_or_empty,
     validate_template_text,
     validate_value_for,
 )
+from shared.deploy_plan import PlanStep
 
 __all__ = [
     "DEPRECATED",
@@ -55,12 +57,17 @@ __all__ = [
     "TESTED",
     "VALIDATED",
     "LoadedTemplate",
+    "TemplateApplyParams",
     "TemplateError",
+    "TemplateRef",
     "TemplateSpec",
     "TemplateStep",
+    "build_template_plan",
     "compute_checksum",
     "dry_run_params",
     "load_template",
+    "plan_template_apply",
+    "validate_apply_inputs",
     "validate_template",
 ]
 
@@ -218,14 +225,14 @@ def compute_checksum(files: Mapping[str, str]) -> str:
 def _path_mode(model_field: Any) -> str:
     """``"read"`` or ``"write"`` for a parameter, from its declared type.
 
-    A field is a read path when its validators are ``validate_read_path``; the
+    A field is a read path when its validator is one of the two read rules; the
     write rule (``validate_path``) is the default. Driving this off the field's
     *type* rather than its name is what lets ``system.check_disk.path`` probe
     ``/opt/opspilot/apps`` while ``file.render.path`` still has to stay inside
     the write allowlist.
     """
     for meta in getattr(model_field, "metadata", ()) or ():
-        if getattr(meta, "func", None) is validate_read_path:
+        if getattr(meta, "func", None) in (validate_read_path, validate_read_path_or_empty):
             return "read"
     return "write"
 
@@ -432,6 +439,150 @@ def dry_run_params(
     return problems
 
 
+def _secret_input_names(inputs_schema: Mapping[str, Any]) -> frozenset[str]:
+    """Names the template fills from ``config_ref`` rather than from the body.
+
+    Marked with ``"x-secret": true`` on the property. The ``x-`` prefix is the
+    JSON Schema convention for a vendor extension — standard tooling ignores
+    it, and this product uses it to keep a password out of ``ops_task_runs``.
+    """
+    props = inputs_schema.get("properties")
+    if not isinstance(props, Mapping):
+        return frozenset()
+    return frozenset(
+        str(k) for k, v in props.items() if isinstance(v, Mapping) and v.get("x-secret") is True
+    )
+
+
+def _check_inputs_against_schema(
+    inputs_schema: Mapping[str, Any],
+    inputs: Mapping[str, Any],
+    secrets: Mapping[str, str] | None = None,
+    *,
+    pending_secrets: Collection[str] = (),
+) -> list[str]:
+    """Every required input present, nothing undeclared, nothing missing.
+
+    The schema is JSON Schema, but V1 only relies on ``properties``,
+    ``required`` and the ``x-secret`` extension for this gate: the action's own
+    Pydantic model is what actually refuses a bad value, and :func:`render`
+    re-checks each value's shape as it lands. This check exists so a typo in an
+    input name is a refusal at submit time rather than an unresolved
+    placeholder at run time.
+
+    ``x-secret`` names may only arrive through *secrets*. Letting them into
+    *inputs* would put them in the task body, which is exactly what the
+    extension exists to prevent. *pending_secrets* names them when the caller
+    is the API and the bundle has not been resolved yet.
+    """
+    props = inputs_schema.get("properties")
+    if not isinstance(props, Mapping):
+        return ["inputs schema has no properties"]
+    declared = set(props)
+    secret_names = _secret_input_names(inputs_schema)
+    supplied = set(inputs) | set(secrets or {}) | set(pending_secrets)
+    errors: list[str] = []
+    required = inputs_schema.get("required") or []
+    for name in sorted(set(required) - supplied):
+        errors.append(f"missing required input {name!r}")
+    for name in sorted(supplied - declared - set(pending_secrets)):
+        errors.append(f"input {name!r} is not declared in the inputs schema")
+    for name in sorted(set(inputs) & secret_names):
+        errors.append(
+            f"input {name!r} is declared x-secret and must not be sent in the "
+            "task body; name it in config_ref instead"
+        )
+    for name in sorted(set(secrets or {}) - secret_names):
+        errors.append(f"secret {name!r} is not declared x-secret in the inputs schema")
+    return errors
+
+
+def validate_apply_inputs(
+    inputs_schema: Mapping[str, Any], inputs: Mapping[str, Any]
+) -> list[str]:
+    """What the API can check at submit, before any secret exists.
+
+    Same rules as the execution-time gate, except that ``x-secret`` names are
+    neither required nor allowed here. The bundle that will fill them is
+    resolved on the worker: a submit that demanded the password would be a
+    submit that could never succeed, and a submit that accepted it would be
+    putting the password in the task body.
+
+    Returns problems rather than raising — the caller turns them into a 422
+    with all of them listed.
+    """
+    return _check_inputs_against_schema(
+        inputs_schema,
+        inputs,
+        secrets=None,
+        pending_secrets=_secret_input_names(inputs_schema),
+    )
+
+
+def build_template_plan(
+    spec: TemplateSpec,
+    inputs_schema: Mapping[str, Any],
+    inputs: Mapping[str, Any],
+    server: Mapping[str, Any] | None = None,
+    *,
+    secrets: Mapping[str, str] | None = None,
+) -> tuple[PlanStep, ...]:
+    """Render a template with concrete inputs into the plan the worker runs.
+
+    This is the seam between "a published template" and "work on one host".
+    It is deliberately the same shape as ``build_deploy_plan`` so the worker's
+    step runner is shared rather than forked.
+
+    Two things it will not do:
+
+    * **It does not fetch secrets.** Every value in *inputs* must already be
+      non-secret. Secret material arrives separately at execution time and is
+      passed in as *secrets*, so it never has to travel through
+      ``ops_task_steps.params_json`` to reach the host.
+    * **It does not authorise.** Whether the caller may run this template is
+      the API's decision. This function only refuses input it cannot render.
+
+    *secrets* are merged into the render map but must be **declared** in the
+    inputs schema and marked ``"x-secret": true`` — a template cannot smuggle a
+    name the author never wrote down, and a password cannot arrive by the same
+    door as a hostname.
+
+    Raises :class:`TemplateError` when the inputs do not satisfy the schema or
+    when a rendered step's values are refused by the action that will run them.
+    """
+    errors = _check_inputs_against_schema(inputs_schema, inputs, secrets)
+    if errors:
+        raise TemplateError("; ".join(errors))
+    provided = {**dict(inputs), **dict(secrets or {})}
+
+    plan: list[PlanStep] = []
+    for step in spec.steps:
+        try:
+            action_spec = spec_of(step.action)
+        except UnknownAction as exc:  # pragma: no cover - validate_template catches this
+            raise TemplateError(f"step {step.key!r}: {exc}") from exc
+
+        def bind(_path: str, text: str) -> Any:
+            return render(text, provided, server)
+
+        try:
+            rendered = _map_strings(step.params, bind)
+            action_spec.params.model_validate(rendered)
+        except (RenderError, ValidationError, ValueError) as exc:
+            raise TemplateError(f"step {step.key!r} ({step.action}): {exc}") from exc
+
+        plan.append(
+            PlanStep(
+                key=step.key,
+                action=step.action,
+                idempotency_class=str(action_spec.idempotency_class),
+                params=dict(rendered),
+                flips_link=step.action == "app.switch_current",
+            )
+        )
+    return tuple(plan)
+
+
 # --------------------------------------------------------------------------
 # Loading
 # --------------------------------------------------------------------------
@@ -509,3 +660,78 @@ def load_template(root: Path | str, *, registry_checked: bool = True) -> LoadedT
         checksum=compute_checksum(files),
         files=files,
     )
+
+
+# --------------------------------------------------------------------------
+# The template.apply task body
+# --------------------------------------------------------------------------
+class TemplateRef(BaseModel):
+    """Which published body a task is bound to.
+
+    ``checksum`` is the pin: it is what stops a later edit to the catalog from
+    changing what a queued task will do. The worker refuses a mismatch rather
+    than running whatever is there now.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=64)
+    version: str = Field(min_length=1, max_length=64)
+    checksum: str = Field(min_length=64, max_length=64)
+
+
+class TemplateApplyParams(BaseModel):
+    """The body of a ``template.apply`` task.
+
+    Deliberately self-contained. The approved template body travels with the
+    task, so the worker rebuilds exactly the plan the API approved without
+    reaching back into the catalog — and the catalog can move on (a new version
+    published, an old one deprecated) without changing what a queued run does.
+
+    ``inputs`` are non-secret and are what the API validated. Secret material
+    is named only by ``config_ref`` and is resolved on the host side at
+    execution time, so it never lands in ``ops_task_runs`` or in a log line.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    template: TemplateRef
+    spec: TemplateSpec
+    inputs_schema: dict[str, Any]
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    config_ref: str = Field(default="", max_length=255)
+
+
+def plan_template_apply(
+    payload: Mapping[str, Any] | TemplateApplyParams,
+    server: Mapping[str, Any] | None = None,
+    *,
+    secrets: Mapping[str, str] | None = None,
+) -> tuple[PlanStep, ...]:
+    """Validate one ``template.apply`` body and render the plan it commits to.
+
+    Shared by the API (at submit, with no secrets) and the worker (at
+    execution, with the ``config_ref`` bundle resolved). Same function both
+    sides, so what one accepts the other will run.
+    """
+    try:
+        params = (
+            payload
+            if isinstance(payload, TemplateApplyParams)
+            else TemplateApplyParams.model_validate(dict(payload))
+        )
+    except ValidationError as exc:
+        raise TemplateError(f"template.apply body is not valid: {exc}") from exc
+
+    try:
+        return build_template_plan(
+            params.spec,
+            params.inputs_schema,
+            params.inputs,
+            server,
+            secrets=secrets,
+        )
+    except TemplateError as exc:
+        raise TemplateError(
+            f"template {params.template.name!r} {params.template.version!r}: {exc}"
+        ) from exc

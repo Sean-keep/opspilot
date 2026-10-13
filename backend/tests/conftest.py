@@ -204,6 +204,25 @@ def viewer(db: Session, seeded: Session) -> Any:
     return user
 
 
+@pytest.fixture()
+def operator(db: Session, seeded: Session) -> Any:
+    """An account with the ``operator`` role.
+
+    Deliberately *not* an admin: ``operator`` holds ``template.apply`` but not
+    ``middleware.install``, which is exactly the pair the middleware extra gate
+    has to separate. An admin would hold both and prove nothing.
+    """
+    auth = AuthService(db)
+    user = auth.create_user(
+        UserCreate(
+            username="operator", password="operator-password-1234", display_name="Operator"
+        )
+    )
+    auth.grant_role(user, "operator")
+    db.commit()
+    return user
+
+
 # --------------------------------------------------------------------------
 # Optional live SSH target
 # --------------------------------------------------------------------------
@@ -282,6 +301,16 @@ def viewer_headers(client: TestClient, viewer: Any) -> dict[str, str]:
     resp = client.post(
         "/api/v1/auth/login",
         json={"username": "viewer", "password": "viewer-password-1234"},
+    )
+    assert resp.status_code == 200, resp.text
+    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
+
+@pytest.fixture()
+def operator_headers(client: TestClient, operator: Any) -> dict[str, str]:
+    resp = client.post(
+        "/api/v1/auth/login",
+        json={"username": "operator", "password": "operator-password-1234"},
     )
     assert resp.status_code == 200, resp.text
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}

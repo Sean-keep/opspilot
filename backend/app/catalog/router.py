@@ -17,21 +17,25 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import Depends, Response
 
 from backend.app.api.routing import AppRouter
 from backend.app.audit.service import write_audit
 from backend.app.auth.deps import DbSession, require_permission
 from backend.app.auth.models import User
+from backend.app.auth.service import AuthService
 from backend.app.catalog.models import TEMPLATE_DEPRECATED, Template, TemplateVersion
 from backend.app.catalog.schemas import (
+    TemplateApplyIn,
     TemplateOut,
     TemplateValidateResult,
     TemplateVersionDetailOut,
     TemplateVersionOut,
 )
 from backend.app.catalog.service import CatalogService, InvalidTransition, TemplateConflict
-from backend.app.core.errors import Conflict, NotFound
+from backend.app.core.errors import Conflict, Forbidden, NotFound
+from backend.app.orchestrator.schemas import TaskOut
+from backend.app.orchestrator.service import TaskService
 
 router = AppRouter(prefix="/templates", tags=["catalog"])
 
@@ -39,12 +43,26 @@ CanRead = Annotated[User, Depends(require_permission("template.read"))]
 CanValidate = Annotated[User, Depends(require_permission("template.validate"))]
 CanPublish = Annotated[User, Depends(require_permission("template.publish"))]
 CanDeprecate = Annotated[User, Depends(require_permission("template.deprecate"))]
+CanApply = Annotated[User, Depends(require_permission("template.apply"))]
+
+#: Categories that reconfigure a *shared* service rather than one application's
+#: own files. Applying one of these is a ``middleware.install`` in disguise, so
+#: holding only ``template.apply`` must not be enough to reach it — otherwise
+#: the permission that exists to gate installing Redis would be decorative.
+MIDDLEWARE_CATEGORIES = frozenset({"middleware", "database"})
 
 def _service(db: DbSession) -> CatalogService:
     return CatalogService(db)
 
 
 ServiceDep = Annotated[CatalogService, Depends(_service)]
+
+
+def _tasks(db: DbSession) -> TaskService:
+    return TaskService(db)
+
+
+TasksDep = Annotated[TaskService, Depends(_tasks)]
 
 
 def _map_conflict[T](fn: Callable[[], T]) -> T:
@@ -206,3 +224,78 @@ def deprecate_version(
         detail=notes,
     )
     return _version_out(row)
+
+
+# --------------------------------------------------------------------------
+# Apply
+# --------------------------------------------------------------------------
+@router.post(
+    "/{template_id}/versions/{version}/apply",
+    response_model=TaskOut,
+    status_code=202,
+)
+def apply_version(
+    template_id: int,
+    version: str,
+    payload: TemplateApplyIn,
+    response: Response,
+    user: CanApply,
+    service: ServiceDep,
+    tasks: TasksDep,
+) -> TaskOut:
+    """Queue a published template to run on each target server.
+
+    ``202 Accepted`` because nothing has happened yet. Follow ``Location`` for
+    status or watch ``GET /api/v1/tasks/{id}/events`` for live logs; one task
+    carries one run per target, so a 20-server rollout is one task with twenty
+    runs, each with its own steps and its own outcome.
+
+    Unlike ``app.deploy`` there is no automatic undo: a template has no
+    previous ``current`` to put back. A run that fails stops at the failing
+    step and says which one.
+
+    Applying a *middleware* or *database* template also needs
+    ``middleware.install``. That permission exists to gate installing Redis,
+    MySQL, Nginx or Supervisor, and it would be decorative if ``template.apply``
+    were a way around it.
+    """
+    template = _require_version(service, template_id, version)
+    if template.category in MIDDLEWARE_CATEGORIES and not AuthService(
+        service.db
+    ).has_permission(user, "middleware.install"):
+        raise Forbidden(
+            f"template {template.name!r} is in category {template.category!r}; "
+            "applying it needs 'middleware.install' as well as 'template.apply'"
+        )
+
+    body = _map_conflict(
+        lambda: service.build_apply_params(
+            template.name,
+            version,
+            inputs=payload.inputs,
+            config_ref=payload.config_ref,
+        )
+    )
+    task, _created = tasks.create(
+        kind="template.apply",
+        title=f"apply {template.name} {version}",
+        params=body,
+        server_ids=[t.server_id for t in payload.targets],
+        actor_id=user.id,
+        actor_name=user.username,
+    )
+    write_audit(
+        "template.apply",
+        actor_id=user.id,
+        actor_name=user.username,
+        target_type="template_version",
+        target_id=f"{template.name}@{version}",
+        task_id=task.id,
+        snapshot={
+            "targets": sorted(t.server_id for t in payload.targets),
+            "checksum": body["template"]["checksum"],
+            "config_ref": payload.config_ref or "",
+        },
+    )
+    response.headers["Location"] = f"/api/v1/tasks/{task.id}"
+    return TaskOut(**tasks.to_out(task))

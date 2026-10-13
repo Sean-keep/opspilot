@@ -1,0 +1,43 @@
+api_version: v1
+name: redis
+version: 1.0.0
+description: >-
+  Install the distribution's Redis server on a managed host and prove it
+  answers PING. The service runs as the dedicated redis user the package
+  creates — never as root. This template never creates, initialises, resets,
+  or upgrades a data directory: if the datadir is missing it reports that and
+  stops, and it never writes a Redis config file.
+
+  It installs whatever redis-server the distribution ships (7.0.x on
+  Ubuntu 24.04). A pinned 7.4 source build is not expressible with the V1
+  action registry and is deliberately not faked here.
+inputs_schema: schemas/inputs.schema.json
+
+steps:
+  - key: check_os
+    action: system.check_os
+    params:
+      expect: ["ubuntu-22.04", "ubuntu-24.04", "debian-12"]
+
+  - key: check_datadir_space
+    action: system.check_disk
+    params:
+      path: "{{ inputs.datadir }}"
+      min_available_mb: "{{ inputs.min_free_mb }}"
+
+  - key: ensure_user
+    action: system.ensure_user
+    params:
+      username: "{{ inputs.redis_user }}"
+      shell: /usr/sbin/nologin
+
+  - key: install_packages
+    action: package.install
+    params:
+      packages: ["redis-server", "redis-tools"]
+
+  - key: probe_redis
+    action: redis.precheck
+    params:
+      host: "{{ inputs.redis_host }}"
+      port: "{{ inputs.redis_port }}"

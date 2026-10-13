@@ -41,6 +41,7 @@ PERMISSION_CATALOG: dict[str, str] = {
     "template.validate": "Validate template parameters before submitting a task",
     "template.publish": "Publish a template version (immutable once published)",
     "template.deprecate": "Deprecate a published template version",
+    "template.apply": "Run a published template version on target servers",
     # -- tasks (S2) ------------------------------------------------------
     "task.read": "View tasks, runs, steps, and logs",
     "task.create": "Submit an install, deploy, or check task",
@@ -79,6 +80,7 @@ DEFAULT_ROLES: dict[str, RoleSpec] = {
             "credential.update",
             "template.read",
             "template.validate",
+            "template.apply",
             "task.read",
             "task.create",
             "task.cancel",

@@ -48,6 +48,7 @@ from shared.actions.base import (
 )
 from shared.actions.params import (
     NonEmpty,
+    OptionalReadPath,
     OptionalUserName,
     OptionalVersion,
     Packages,
@@ -1166,7 +1167,7 @@ class MysqlPrecheckParams(ParamsModel):
     host: NonEmpty = "127.0.0.1"
     port: tcp_port = 3306
     #: Read-only probe of a data directory. Never created, never initialised.
-    datadir: ReadPath = ""
+    datadir: OptionalReadPath = ""
     expect_existing_datadir: bool = True
 
 
@@ -1239,7 +1240,7 @@ class RedisPrecheckParams(ParamsModel):
     host: NonEmpty = "127.0.0.1"
     port: tcp_port = 6379
     #: Read-only existence probe. Never written, never replaced.
-    config_path: ReadPath = ""
+    config_path: OptionalReadPath = ""
 
 
 @register(

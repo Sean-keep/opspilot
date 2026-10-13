@@ -67,7 +67,7 @@ IDEMPOTENCY_SCOPE = "POST /api/v1/tasks"
 #: ignores is a task that sits in the queue forever, which is worse than a
 #: rejection at submit time.
 TASK_KINDS: frozenset[str] = frozenset(
-    {"server.check", "app.deploy", "app.rollback"}
+    {"server.check", "app.deploy", "app.rollback", "template.apply"}
 )
 
 

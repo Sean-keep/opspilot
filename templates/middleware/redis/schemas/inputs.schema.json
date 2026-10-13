@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "redis inputs",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["datadir"],
+  "properties": {
+    "datadir": {
+      "type": "string",
+      "pattern": "^/[A-Za-z0-9._/-]{1,120}$",
+      "default": "/var/lib/redis",
+      "description": "Redis data directory. Probed read-only; never created, initialised, or reset."
+    },
+    "min_free_mb": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1048576,
+      "default": 512,
+      "description": "Free space the datadir must have before an install is attempted."
+    },
+    "redis_user": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]{0,31}$",
+      "default": "redis",
+      "description": "Dedicated system account Redis runs as. Never root."
+    },
+    "redis_host": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9.-]{0,62}[a-z0-9])?$",
+      "default": "127.0.0.1",
+      "description": "Host Redis is expected to answer on after the install."
+    },
+    "redis_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 6379,
+      "description": "Port Redis is expected to answer on after the install."
+    }
+  }
+}

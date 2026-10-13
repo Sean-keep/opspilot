@@ -57,3 +57,23 @@ class TemplateValidateResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     status: str
+
+
+class TemplateApplyTarget(BaseModel):
+    """One server the template should be applied to."""
+
+    server_id: int = Field(gt=0)
+
+
+class TemplateApplyIn(BaseModel):
+    """Run a published template version against one or more servers.
+
+    ``inputs`` are the non-secret values the template declares. Anything the
+    template fills from a stored secret is named only by ``config_ref`` and is
+    resolved on the worker at execution time — the values never appear here,
+    in the task row, or in a log line.
+    """
+
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    targets: list[TemplateApplyTarget] = Field(min_length=1, max_length=200)
+    config_ref: str = Field(default="", max_length=255)

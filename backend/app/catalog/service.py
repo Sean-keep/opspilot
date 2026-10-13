@@ -27,6 +27,7 @@ from shared.templates import (
     TemplateSpec,
     dry_run_params,
     load_template,
+    validate_apply_inputs,
     validate_template,
 )
 from sqlalchemy import select
@@ -41,7 +42,7 @@ from backend.app.catalog.models import (
     Template,
     TemplateVersion,
 )
-from backend.app.core.errors import NotFound
+from backend.app.core.errors import NotFound, ValidationError
 from backend.app.db.base import utcnow
 
 
@@ -246,6 +247,62 @@ class CatalogService:
             self.transition(template_name, version, TEMPLATE_VALIDATED)
             result["status"] = TEMPLATE_VALIDATED
         return result
+
+    # ------------------------------------------------------------------
+    # Apply
+    # ------------------------------------------------------------------
+    def build_apply_params(
+        self,
+        template_name: str,
+        version: str,
+        *,
+        inputs: Mapping[str, Any],
+        config_ref: str = "",
+    ) -> dict[str, Any]:
+        """Turn a published version into the body of a ``template.apply`` task.
+
+        Refuses anything that is not ``PUBLISHED``: a template is only runnable
+        once its body is frozen **and** somebody has said it works. DRAFT and
+        VALIDATED bodies are still being edited in spirit even when frozen in
+        fact, and running one on a live host is how a half-tested step gets
+        there.
+
+        The body is self-contained — spec and inputs schema travel with the
+        task — so the worker rebuilds exactly what was approved here without
+        going back to the catalog. The checksum is carried alongside so the run
+        records which body it committed to.
+
+        Raises :class:`ValidationError` when the inputs do not satisfy the
+        schema. Only the body is checked here — rendering the plan needs the
+        ``config_ref`` bundle, which this process must never touch. The worker
+        builds the plan from the same body at execution time. Nothing is
+        written; the caller creates the task.
+        """
+        row = self.get_version(template_name, version)
+        if row is None:
+            raise NotFound(f"no template {template_name!r} version {version!r}")
+        if row.status != TEMPLATE_PUBLISHED:
+            raise TemplateConflict(
+                f"{template_name} {version} is {row.status}; only a PUBLISHED "
+                "version may be applied"
+            )
+
+        spec = TemplateSpec.model_validate(row.spec_json)
+        schema = dict(row.inputs_schema_json or {})
+        problems = validate_apply_inputs(schema, inputs)
+        if problems:
+            raise ValidationError("; ".join(problems))
+        return {
+            "template": {
+                "name": template_name,
+                "version": version,
+                "checksum": row.checksum,
+            },
+            "spec": spec.model_dump(),
+            "inputs_schema": schema,
+            "inputs": dict(inputs),
+            "config_ref": config_ref,
+        }
 
     # ------------------------------------------------------------------
     # Lifecycle

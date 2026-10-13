@@ -23,10 +23,12 @@ from shared.actions.render import (
     VERSION_RE,
     validate_path,
     validate_read_path,
+    validate_read_path_or_empty,
 )
 
 __all__ = [
     "NonEmpty",
+    "OptionalReadPath",
     "OptionalUserName",
     "OptionalVersion",
     "Packages",
@@ -108,6 +110,11 @@ RemotePath = Annotated[str, AfterValidator(validate_path)]
 #: A path that will only be read or probed. Absolute and traversal-free, but
 #: not confined to the write prefixes — see ``validate_read_path``.
 ReadPath = Annotated[str, AfterValidator(validate_read_path)]
+
+
+#: For optional probe targets such as ``redis.precheck.config_path``: a real
+#: absolute path, or ``""`` meaning "this step does not look at a file".
+OptionalReadPath = Annotated[str, AfterValidator(validate_read_path_or_empty)]
 NonEmpty = Annotated[str, Field(min_length=1, max_length=512)]
 positive_int = Annotated[int, Field(ge=1)]
 tcp_port = Annotated[int, AfterValidator(_port)]

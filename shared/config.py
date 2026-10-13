@@ -26,6 +26,33 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _normalise_write_prefix(value: str) -> str:
+    """Coerce one ``OPSPILOT_ALLOWED_WRITE_PREFIXES`` entry into a safe prefix.
+
+    A write prefix is a security boundary, so this refuses the shapes that
+    would silently widen it past what the operator wrote: a relative path, the
+    root itself (which would allow everything), any ``..`` component, and any
+    control character. Everything is then normalised to end in ``/`` so that
+    ``startswith`` cannot be satisfied by a sibling directory that merely
+    shares a name prefix (``/opt/app`` matching ``/opt/app-evil``).
+    """
+    prefix = value.strip()
+    if not prefix:
+        raise ValueError(f"write prefix {value!r} is empty")
+    # Checked on the *raw* value: strip() would otherwise eat a trailing
+    # newline and let "/opt/app\n" through as the perfectly clean "/opt/app".
+    if not value.isprintable():
+        raise ValueError(f"write prefix {value!r} contains control characters")
+    if not prefix.startswith("/"):
+        raise ValueError(f"write prefix {value!r} must be an absolute path")
+    parts = [p for p in prefix.split("/") if p]
+    if not parts:
+        raise ValueError("write prefix '/' would allow writing anywhere")
+    if any(p == ".." for p in parts):
+        raise ValueError(f"write prefix {value!r} must not contain '..'")
+    return "/" + "/".join(parts) + "/"
+
+
 class Settings(BaseSettings):
     """Typed view over the ``OPSPILOT_*`` environment."""
 
@@ -77,6 +104,13 @@ class Settings(BaseSettings):
     artifact_allowed_hosts: str = ""
     healthcheck_allowed_cidrs: str = "127.0.0.0/8"
 
+    #: Remote path prefixes a template is allowed to **write** to. Empty means
+    #: "use the defaults in ``shared.actions.render``"; a non-empty value
+    #: *replaces* them. Widen this only when an existing deployment genuinely
+    #: lives outside the defaults — the API and every worker must be given the
+    #: same value, or a plan the API accepted will be refused at execution.
+    allowed_write_prefixes: str = ""
+
     # -- retention -------------------------------------------------------
     log_retention_days: int = Field(default=30, ge=1, le=3650)
     log_max_bytes_per_run: int = Field(default=10 * 1024 * 1024, ge=1024)
@@ -90,6 +124,20 @@ class Settings(BaseSettings):
     @classmethod
     def _strip_str(cls, v: object) -> object:
         return v.strip() if isinstance(v, str) else v
+
+    @field_validator("allowed_write_prefixes")
+    @classmethod
+    def _check_write_prefixes(cls, v: str) -> str:
+        """Reject a boundary-widening entry at startup, not at the first write.
+
+        An empty setting is legal and means "use the product defaults"; every
+        non-empty entry must survive normalisation, so ``/`` or a ``..`` climb
+        stops the process from starting at all.
+        """
+        for part in v.split(","):
+            if part.strip():
+                _normalise_write_prefix(part)
+        return v
 
     @model_validator(mode="after")
     def _check_heartbeat_under_lease(self) -> Settings:
@@ -158,6 +206,17 @@ class Settings(BaseSettings):
 
     def healthcheck_cidrs(self) -> tuple[str, ...]:
         return tuple(c.strip() for c in self.healthcheck_allowed_cidrs.split(",") if c.strip())
+
+    def write_prefixes(self) -> tuple[str, ...]:
+        """The write allowlist to enforce.
+
+        An empty setting means "the defaults" and is resolved by the caller
+        (``shared.actions.render.allowed_path_prefixes``), which is where the
+        default tuple lives. A non-empty setting replaces them wholesale so an
+        operator cannot accidentally get a union wider than they meant.
+        """
+        raw = [p.strip() for p in self.allowed_write_prefixes.split(",")]
+        return tuple(_normalise_write_prefix(p) for p in raw if p.strip())
 
     def safe_summary(self) -> dict[str, object]:
         """A loggable snapshot: every secret reduced to a presence flag.
